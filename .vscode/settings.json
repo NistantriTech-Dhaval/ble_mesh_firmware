@@ -1,0 +1,28 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.espIdfPath": "/Users/nistantritech/esp/esp-idf",
+  "idf.toolsPath": "/Users/nistantritech/.espressif",
+  "idf.pythonInstallPath": "/opt/homebrew/bin/python3",
+  "idf.port": "/dev/tty.usbserial-0001",
+  "idf.flashType": "UART",
+  "files.associations": {
+    "esp_event.h": "c",
+    "esp_netif.h": "c",
+    "esp_ble_mesh_common_api.h": "c",
+    "esp_ble_mesh_defs.h": "c",
+    "mqtt_client.h": "c",
+    "mqtt_manager.h": "c",
+    "type_traits": "c",
+    "unordered_map": "c",
+    "nvs_manager.h": "c",
+    "sensor_client.h": "c"
+  },
+  "idf.openOcdConfigs": [
+    "board/esp32-wrover-kit-3.3v.cfg"
+  ],
+  "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "/Users/nistantritech/.espressif/tools/openocd-esp32/v0.12.0-esp32-20230921/openocd-esp32/share/openocd/scripts",
+    "ESP_ROM_ELF_DIR": "/Users/nistantritech/.espressif/tools/esp-rom-elfs/20230320/",
+    "IDF_TARGET": "esp32"
+  }
+}

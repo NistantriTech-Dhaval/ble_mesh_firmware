@@ -1,0 +1,5 @@
+# Name,         Type,   SubType,    Offset,     Size,   Flags
+nvs,            data,   nvs,        0x11000,    16k
+otadata,        data,   ota,        0x15000,    8k
+phy_init,       data,   phy,        0x17000,    4k
+factory,        app,    factory,    0x20000,    2M
