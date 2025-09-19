@@ -205,6 +205,7 @@ static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32
     net_buf_simple_add_u8(&sensor_data_1, outdoor_temp);
 }
 
+
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                                              esp_ble_mesh_prov_cb_param_t *param)
 {
@@ -274,7 +275,7 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
             {
                 ESP_LOGI(TAG, "Model 0x1102 subscribed — connecting to Wi-Fi...");
                 char node_type[20]; // Array to hold the custom color
-                nvs_get_string_value("node_type", &node_type);
+                nvs_get_string_value("node_type", node_type);
                 if (strcmp(node_type, "sensor_server") == 0)
                 {
                     nvs_save_string_value("node_type", "sensor_client");
@@ -897,8 +898,11 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
             else
             {
                 ESP_LOGW(TAG, "UUID not found for unicast %s", unicast_key);
-                cJSON_Delete(json);
-                return;
+                ESP_LOGW(TAG, "Available addresses in JSON: %s", stored_data);
+                
+                // Use fallback name instead of returning early
+                snprintf(out_name, out_size, "unknown_device_%s", unicast_key);
+                ESP_LOGI(TAG, "Using fallback name: %s", out_name);
             }
 
             cJSON_Delete(json);
@@ -1059,7 +1063,7 @@ void example_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
                     if (net_info_obj)
                     {
                         // Save as raw string into NVS
-                        nvs_save_string_value("network_info", net_info_raw);
+                        nvs_save_string_value("network_info", (char*)net_info_raw);
                         ESP_LOGI(TAG, "Saved Network Info: %s", net_info_raw);
 
                         // Work with net_info_obj if needed
