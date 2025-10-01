@@ -21,21 +21,20 @@
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_sensor_model_api.h"
 #include "esp_ble_mesh_defs.h"
-
+#include "custom_characteristic.h"
 #include "ble_mesh_example_init.h"
 #include "board.h"
 #include "mqtt_manager.h"
 #include "wifi_manager.h"
 #include "nvs_manager.h"
 #include "cJSON.h"
-#define TAG "SERVER"
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_sensor_model_api.h"
 #include "esp_ble_mesh_networking_api.h"
 
 #define CID_ESP 0x02E5
-
+#define TAG "BLE MESH"
 /* Sensor Property IDs */
 #define SENSOR_PROPERTY_ID_0 0x0056 /* Present Indoor Ambient Temperature */
 #define SENSOR_PROPERTY_ID_1 0x005B /* Present Outdoor Ambient Temperature */
@@ -204,7 +203,6 @@ static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32
     net_buf_simple_add_u8(&sensor_data_0, indoor_temp);
     net_buf_simple_add_u8(&sensor_data_1, outdoor_temp);
 }
-
 
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                                              esp_ble_mesh_prov_cb_param_t *param)
@@ -899,7 +897,7 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
             {
                 ESP_LOGW(TAG, "UUID not found for unicast %s", unicast_key);
                 ESP_LOGW(TAG, "Available addresses in JSON: %s", stored_data);
-                
+
                 // Use fallback name instead of returning early
                 snprintf(out_name, out_size, "unknown_device_%s", unicast_key);
                 ESP_LOGI(TAG, "Using fallback name: %s", out_name);
@@ -1063,7 +1061,7 @@ void example_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
                     if (net_info_obj)
                     {
                         // Save as raw string into NVS
-                        nvs_save_string_value("network_info", (char*)net_info_raw);
+                        nvs_save_string_value("network_info", (char *)net_info_raw);
                         ESP_LOGI(TAG, "Saved Network Info: %s", net_info_raw);
 
                         // Work with net_info_obj if needed
@@ -1114,7 +1112,10 @@ void example_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
 static esp_err_t ble_mesh_init(void)
 {
     esp_err_t err;
-
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    esp_ble_gatts_register_callback(gatts_event_handler);
+    esp_ble_gap_register_callback(gap_event_handler);
+    esp_ble_gatts_app_register(ESP_APP_ID);
     esp_ble_mesh_register_prov_callback(example_ble_mesh_provisioning_cb);
     esp_ble_mesh_register_config_server_callback(example_ble_mesh_config_server_cb);
     esp_ble_mesh_register_sensor_server_callback(example_ble_mesh_sensor_server_cb);
