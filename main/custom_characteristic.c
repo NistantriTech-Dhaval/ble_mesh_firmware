@@ -26,6 +26,9 @@
 #include "esp_gatts_api.h"
 #include "esp_bt_main.h"
 #include "esp_gatt_common_api.h"
+#include "cjson.h"
+#include "nvs_manager.h"
+#include "wifi_manager.h"
 #include "custom_characteristic.h"
 
 #define ADV_CONFIG_FLAG (1 << 0)
@@ -145,9 +148,6 @@ static struct gatts_profile_inst heart_rate_profile_tab[PROFILE_NUM] = {
         .gatts_if = ESP_GATT_IF_NONE, /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
     },
 };
-static uint8_t *ble_json_buffer = NULL;
-static size_t ble_json_len = 0;
-static size_t ble_json_capacity = 0;
 
 /* Service */
 static const uint16_t GATTS_SERVICE_UUID_TEST = 0x00FF;
@@ -328,32 +328,120 @@ void example_prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t 
            param->write.len);
     prepare_write_env->prepare_len += param->write.len;
 }
-void append_ble_bytes(uint8_t *data, size_t len) {
-    if (ble_json_len + len > ble_json_capacity) {
-        // double buffer size strategy
-        size_t new_capacity = (ble_json_len + len) * 2;
-        uint8_t *new_buf = (uint8_t *)realloc(ble_json_buffer, new_capacity);
-        if (!new_buf) {
-            ESP_LOGE(GATTS_TABLE_TAG, "Failed to allocate memory for BLE buffer");
-            free(ble_json_buffer);
-            ble_json_buffer = NULL;
-            ble_json_len = 0;
-            ble_json_capacity = 0;
-            return;
-        }
-        ble_json_buffer = new_buf;
-        ble_json_capacity = new_capacity;
+
+void handle_config_json(char *json_str)
+{
+    if (!json_str)
+        return;
+
+    cJSON *root = cJSON_Parse(json_str);
+    if (!root)
+    {
+        ESP_LOGE(TAG, "Failed to parse JSON");
+        free(json_str);
+        return;
     }
 
-    memcpy(ble_json_buffer + ble_json_len, data, len);
-    ble_json_len += len;
+    cJSON *config = cJSON_GetObjectItem(root, "config");
+    if (config && cJSON_IsObject(config))
+    {
+
+        cJSON *ssid_item = cJSON_GetObjectItem(config, "ssid");
+        cJSON *pass_item = cJSON_GetObjectItem(config, "password");
+        cJSON *type_item = cJSON_GetObjectItem(config, "type");
+        cJSON *gw_item = cJSON_GetObjectItem(config, "isgateway");
+        cJSON *net_info = cJSON_GetObjectItem(config, "network_info");
+
+        int type = (type_item && cJSON_IsNumber(type_item)) ? type_item->valueint : 2;
+        bool is_gateway = (gw_item && cJSON_IsBool(gw_item)) ? cJSON_IsTrue(gw_item) : false;
+
+        if (type == 1)
+        { // Mesh type
+            if (is_gateway)
+            {
+                // Gateway mesh: SSID/password + network info
+                if (!ssid_item || !pass_item || !cJSON_IsString(ssid_item) || !cJSON_IsString(pass_item))
+                {
+                    ESP_LOGE(TAG, "Missing SSID or password for gateway mesh");
+                }
+                else
+                {
+                    const char *ssid = ssid_item->valuestring;
+                    const char *password = pass_item->valuestring;
+                    nvs_save_wifi_credentials((char *)ssid, (char *)password);
+
+                    if (net_info && cJSON_IsString(net_info))
+                    {
+                        const char *net_info_raw = net_info->valuestring;
+                        cJSON *net_info_obj = cJSON_Parse(net_info_raw);
+                        if (net_info_obj)
+                        {
+                            nvs_save_string_value("network_info", (char *)net_info_raw);
+                            cJSON_Delete(net_info_obj);
+                            ESP_LOGI(TAG, "Saved network info");
+                        }
+                        else
+                        {
+                            ESP_LOGE(TAG, "Failed to parse network_info JSON");
+                        }
+                    }
+                    nvs_save_string_value("mesh_type", "mesh_gateway");
+                }
+            }
+            else
+            {
+                // Non-gateway mesh: no SSID/password
+                nvs_delete_key("ssid");
+                nvs_delete_key("password");
+                nvs_delete_key("network_info");
+                nvs_save_string_value("mesh_type", "mesh_node");
+            }
+        }
+        else
+        { // Standalone Wi-Fi
+            if (!ssid_item || !pass_item || !cJSON_IsString(ssid_item) || !cJSON_IsString(pass_item))
+            {
+                ESP_LOGE(TAG, "Missing SSID or password for standalone Wi-Fi");
+            }
+            else
+            {
+                const char *ssid = ssid_item->valuestring;
+                const char *password = pass_item->valuestring;
+                nvs_save_wifi_credentials((char *)ssid, (char *)password);
+                nvs_save_string_value("mesh_type", "mesh_standalone");
+            }
+        }
+
+        ESP_LOGI(TAG, "Restarting ESP32 to apply new Wi-Fi settings...");
+
+        esp_restart();
+    }
+    cJSON_Delete(root);
+    free(json_str);
 }
 
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
 {
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && prepare_write_env->prepare_buf)
     {
-        esp_log_buffer_hex(GATTS_TABLE_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+        ESP_LOGI(GATTS_TABLE_TAG, "Full data length = %d", prepare_write_env->prepare_len);
+
+        char *json_str = (char *)malloc(prepare_write_env->prepare_len + 1); // +1 for null terminator
+        if (json_str)
+        {
+            memcpy(json_str, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+            json_str[prepare_write_env->prepare_len] = '\0'; // null-terminate
+
+            // Print full JSON
+            ESP_LOGI(GATTS_TABLE_TAG, "Full data as JSON: %s", json_str);
+            handle_config_json(json_str);
+        }
+        else
+        {
+            ESP_LOGE(GATTS_TABLE_TAG, "Failed to allocate memory for JSON string");
+        }
+        // Reset buffer for next write
+        prepare_write_env->prepare_len = 0;
     }
     else
     {
@@ -366,11 +454,6 @@ void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble
     }
     prepare_write_env->prepare_len = 0;
 }
-bool is_json_complete(void) {
-    if (ble_json_len == 0) return false;
-    return ble_json_buffer[ble_json_len - 1] == '}'; // simple check
-}
-
 
 void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
@@ -422,85 +505,61 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
     case ESP_GATTS_READ_EVT:
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_READ_EVT");
         break;
-    // case ESP_GATTS_WRITE_EVT:
-    //     if (!param->write.is_prep){
-    //         // the data length of gattc write  must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
-    //         ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
-    //         esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
-    //         if (heart_rate_handle_table[IDX_CHAR_CFG_A] == param->write.handle && param->write.len == 2){
-    //             uint16_t descr_value = param->write.value[1]<<8 | param->write.value[0];
-    //             if (descr_value == 0x0001){
-    //                 ESP_LOGI(GATTS_TABLE_TAG, "notify enable");
-    //                 uint8_t notify_data[15];
-    //                 for (int i = 0; i < sizeof(notify_data); ++i)
-    //                 {
-    //                     notify_data[i] = i % 0xff;
-    //                 }
-    //                 //the size of notify_data[] need less than MTU size
-    //                 esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
-    //                                         sizeof(notify_data), notify_data, false);
-    //             }else if (descr_value == 0x0002){
-    //                 ESP_LOGI(GATTS_TABLE_TAG, "indicate enable");
-    //                 uint8_t indicate_data[15];
-    //                 for (int i = 0; i < sizeof(indicate_data); ++i)
-    //                 {
-    //                     indicate_data[i] = i % 0xff;
-    //                 }
-    //                 //the size of indicate_data[] need less than MTU size
-    //                 esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
-    //                                     sizeof(indicate_data), indicate_data, true);
-    //             }
-    //             else if (descr_value == 0x0000){
-    //                 ESP_LOGI(GATTS_TABLE_TAG, "notify/indicate disable ");
-    //             }else{
-    //                 ESP_LOGE(GATTS_TABLE_TAG, "unknown descr value");
-    //                 esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
-    //             }
-
-    //         }
-    //         /* send response when param->write.need_rsp is true*/
-    //         if (param->write.need_rsp){
-    //             esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
-    //         }
-    //     }else{
-    //         /* handle prepare write */
-    //         example_prepare_write_event_env(gatts_if, &prepare_write_env, param);
-    //     }
-    //     break;
-case ESP_GATTS_WRITE_EVT:
-    if (!param->write.is_prep) {
-        // Append incoming bytes
-        append_ble_bytes(param->write.value, param->write.len);
-
-        // Optionally log received bytes
-        ESP_LOGI(GATTS_TABLE_TAG, "Received %d bytes", param->write.len);
-        esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
-
-        // Check if we have full JSON
-        if (is_json_complete()) {
-            // Null terminate for printing/parsing
-            ble_json_buffer[ble_json_len] = '\0';
-            ESP_LOGI(GATTS_TABLE_TAG, "Full JSON received: %s", ble_json_buffer);
-
-            // TODO: parse JSON using cJSON or your parser
-            // cJSON *json = cJSON_Parse((char*)ble_json_buffer);
-            // if (json) { cJSON_Delete(json); }
-
-            // Reset buffer for next message
-            ble_json_len = 0;
+    case ESP_GATTS_WRITE_EVT:
+        ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_WRITE_EVT");
+        if (!param->write.is_prep)
+        {
+            // the data length of gattc write  must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
+            ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
+            esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
+            if (heart_rate_handle_table[IDX_CHAR_CFG_A] == param->write.handle && param->write.len == 2)
+            {
+                uint16_t descr_value = param->write.value[1] << 8 | param->write.value[0];
+                if (descr_value == 0x0001)
+                {
+                    ESP_LOGI(GATTS_TABLE_TAG, "notify enable");
+                    uint8_t notify_data[15];
+                    for (int i = 0; i < sizeof(notify_data); ++i)
+                    {
+                        notify_data[i] = i % 0xff;
+                    }
+                    // the size of notify_data[] need less than MTU size
+                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
+                                                sizeof(notify_data), notify_data, false);
+                }
+                else if (descr_value == 0x0002)
+                {
+                    ESP_LOGI(GATTS_TABLE_TAG, "indicate enable");
+                    uint8_t indicate_data[15];
+                    for (int i = 0; i < sizeof(indicate_data); ++i)
+                    {
+                        indicate_data[i] = i % 0xff;
+                    }
+                    // the size of indicate_data[] need less than MTU size
+                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
+                                                sizeof(indicate_data), indicate_data, true);
+                }
+                else if (descr_value == 0x0000)
+                {
+                    ESP_LOGI(GATTS_TABLE_TAG, "notify/indicate disable ");
+                }
+                else
+                {
+                    ESP_LOGE(GATTS_TABLE_TAG, "unknown descr value");
+                    esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
+                }
+            }
+            /* send response when param->write.need_rsp is true*/
+            if (param->write.need_rsp)
+            {
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+            }
         }
-
-        // Send response if needed
-        if (param->write.need_rsp) {
-            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+        else
+        {
+            /* handle prepare write */
+            example_prepare_write_event_env(gatts_if, &prepare_write_env, param);
         }
-    } else {
-        // handle prepare writes
-        example_prepare_write_event_env(gatts_if, &prepare_write_env, param);
-    }
-    break;
-
-
         break;
     case ESP_GATTS_EXEC_WRITE_EVT:
         // the length of gattc prepare write data must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.

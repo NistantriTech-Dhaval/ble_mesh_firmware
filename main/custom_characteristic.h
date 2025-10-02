@@ -9,6 +9,8 @@
 #include "freertos/task.h"
 
 #define GATTS_TABLE_TAG "GATTS_TABLE_DEMO"
+
+#define TAG "MESH_GATTS"
 #define PROFILE_NUM 1
 #define PROFILE_APP_IDX 0
 #define ESP_APP_ID 0x55
