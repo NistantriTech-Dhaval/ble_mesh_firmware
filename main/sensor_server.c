@@ -271,7 +271,6 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
                      param->value.state_change.mod_sub_add.model_id);
             if (param->value.state_change.mod_sub_add.model_id == 0x1102)
             {
-                ESP_LOGI(TAG, "Model 0x1102 subscribed — connecting to Wi-Fi...");
                 char node_type[20]; // Array to hold the custom color
                 nvs_get_string_value("node_type", node_type);
                 if (strcmp(node_type, "sensor_server") == 0)
@@ -1122,4 +1121,5 @@ void sensorserver_main(void)
     xTaskCreate(sensor_update_task, "sensor_sim_task", 2048, NULL, 5, NULL);
     printf("Starting wifi");
     wifi_init_sta();
+    xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
 }

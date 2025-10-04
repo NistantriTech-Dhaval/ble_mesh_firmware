@@ -189,7 +189,7 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 
         /* Characteristic Value */
         [IDX_CHAR_VAL_B] =
-            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_B, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+            {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_B, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, 0, NULL}},
 
         /* Characteristic Declaration */
         [IDX_CHAR_C] =
@@ -413,6 +413,7 @@ void handle_config_json(char *json_str)
         }
 
         ESP_LOGI(TAG, "Restarting ESP32 to apply new Wi-Fi settings...");
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
         esp_restart();
     }
@@ -503,15 +504,76 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
     }
     break;
     case ESP_GATTS_READ_EVT:
-        ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_READ_EVT");
+    {
+        ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_READ_EVT, handle = %d", param->read.handle);
+
+        esp_gatt_rsp_t rsp;
+        memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+        rsp.attr_value.handle = param->read.handle;
+
+        if (param->read.handle == heart_rate_handle_table[IDX_CHAR_VAL_B])
+        {
+            uint16_t remaining = wifi_total_len - wifi_read_index;
+
+            if (remaining > 0)
+            {
+                // Reserve first byte for remaining length in this chunk
+                uint16_t chunk_len = remaining > (20 - 1) ? (20 - 1) : remaining;
+
+                rsp.attr_value.len = chunk_len + 1;
+                rsp.attr_value.value[0] = remaining - chunk_len; // remaining after this chunk
+
+                // Copy chunk data
+                memcpy(&rsp.attr_value.value[1], wifi_buffer + wifi_read_index, chunk_len);
+
+                esp_log_buffer_hex(GATTS_TABLE_TAG, &rsp.attr_value.value[1], chunk_len);
+
+                char ascii_buf[21]; // max 20 bytes + null
+                int copy_len = chunk_len > 20 ? 20 : chunk_len;
+                memcpy(ascii_buf, wifi_buffer + wifi_read_index, copy_len);
+                ascii_buf[copy_len] = '\0';
+                ESP_LOGI(GATTS_TABLE_TAG, "Chunk as string: %s", ascii_buf);
+                // --- End debug ---
+
+                wifi_read_index += chunk_len;
+
+                // Reset index if last chunk sent
+                if (wifi_read_index >= wifi_total_len)
+                {
+                    ESP_LOGI(GATTS_TABLE_TAG, "All chunks sent. Resetting index.");
+                    wifi_read_index = 0;
+                }
+            }
+            else
+            {
+                // No data left
+                rsp.attr_value.len = 1;
+                rsp.attr_value.value[0] = 0;
+                ESP_LOGI(GATTS_TABLE_TAG, "No remaining data to send");
+            }
+        }
+
+        esp_err_t ret = esp_ble_gatts_send_response(
+            gatts_if,
+            param->read.conn_id,
+            param->read.trans_id,
+            ESP_GATT_OK,
+            &rsp);
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(GATTS_TABLE_TAG, "Failed to send response: %d", ret);
+        }
+
         break;
+    }
+
     case ESP_GATTS_WRITE_EVT:
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_WRITE_EVT");
         if (!param->write.is_prep)
         {
             // the data length of gattc write  must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
             ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
-            esp_log_buffer_hex(GATTS_TABLE_TAG, param->write.value, param->write.len);
             if (heart_rate_handle_table[IDX_CHAR_CFG_A] == param->write.handle && param->write.len == 2)
             {
                 uint16_t descr_value = param->write.value[1] << 8 | param->write.value[0];
