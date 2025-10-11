@@ -350,8 +350,7 @@ void handle_config_json(char *json_str)
         cJSON *pass_item = cJSON_GetObjectItem(config, "password");
         cJSON *type_item = cJSON_GetObjectItem(config, "type");
         cJSON *gw_item = cJSON_GetObjectItem(config, "isgateway");
-        cJSON *net_info = cJSON_GetObjectItem(config, "network_info");
-
+   
         int type = (type_item && cJSON_IsNumber(type_item)) ? type_item->valueint : 2;
         bool is_gateway = (gw_item && cJSON_IsBool(gw_item)) ? cJSON_IsTrue(gw_item) : false;
 
@@ -369,22 +368,6 @@ void handle_config_json(char *json_str)
                     const char *ssid = ssid_item->valuestring;
                     const char *password = pass_item->valuestring;
                     nvs_save_wifi_credentials((char *)ssid, (char *)password);
-
-                    if (net_info && cJSON_IsString(net_info))
-                    {
-                        const char *net_info_raw = net_info->valuestring;
-                        cJSON *net_info_obj = cJSON_Parse(net_info_raw);
-                        if (net_info_obj)
-                        {
-                            nvs_save_string_value("network_info", (char *)net_info_raw);
-                            cJSON_Delete(net_info_obj);
-                            ESP_LOGI(TAG, "Saved network info");
-                        }
-                        else
-                        {
-                            ESP_LOGE(TAG, "Failed to parse network_info JSON");
-                        }
-                    }
                     nvs_save_string_value("mesh_type", "mesh_gateway");
                 }
             }
@@ -393,7 +376,6 @@ void handle_config_json(char *json_str)
                 // Non-gateway mesh: no SSID/password
                 nvs_delete_key("ssid");
                 nvs_delete_key("password");
-                nvs_delete_key("network_info");
                 nvs_save_string_value("mesh_type", "mesh_node");
             }
         }

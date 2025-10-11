@@ -13,6 +13,15 @@ void nvs_delete_key(char *key)
     nvs_close(my_handle);
 }
 
+void nvs_erase_all_key()
+{
+      esp_err_t err = ESP_OK;
+    nvs_handle_t my_handle;
+    err = nvs_open("permenant", NVS_READWRITE, &my_handle);
+    err = nvs_erase_all(my_handle);
+    nvs_commit(my_handle);
+    nvs_close(my_handle);
+}
 void nvs_get_string_value(char *key, char *value)
 {
     nvs_handle_t my_handle;
@@ -24,13 +33,19 @@ void nvs_get_string_value(char *key, char *value)
 
     if (err != ESP_OK)
     {
-                if (strcmp(key, "node_type") == 0)
+        if (strcmp(key, "node_type") == 0)
         {
             printf("Get Default Node Type\n");
             // If the key is led_strip_mode, return the default mode
-            strncpy(value, "sensor_sever", 20);
+            strncpy(value, "sensor_server", 20);
         }
-                  if (strcmp(key, "prov_status") == 0)
+        if (strcmp(key, "mesh_type") == 0)
+        {
+            printf("Get Default Mesh Type\n");
+            // If the key is led_strip_mode, return the default mode
+            strncpy(value, "mesh_node", 20);
+        }
+        if (strcmp(key, "prov_status") == 0)
         {
             printf("Get Default Prov Status\n");
             // If the key is led_strip_mode, return the default mode
@@ -64,7 +79,75 @@ void nvs_save_string_value(char *key, char *value)
     }
     nvs_close(my_handle);
 }
+void nvs_save_blob_value(const char *key, void *data, size_t len)
+{
+    esp_err_t err;
+    nvs_handle_t my_handle;
 
+    err = nvs_open("permenant", NVS_READWRITE, &my_handle);
+    ESP_ERROR_CHECK(err);
+
+    err = nvs_set_blob(my_handle, key, data, len);
+    if (err != ESP_OK) {
+        printf("Error setting blob in NVS: %s\n", esp_err_to_name(err));
+        nvs_close(my_handle);
+        return;
+    }
+
+    err = nvs_commit(my_handle);
+    if (err != ESP_OK) {
+        printf("NVS commit failed for blob\n");
+    }
+
+    nvs_close(my_handle);
+}
+
+int nvs_load_blob_value(const char *key, void *data, size_t *len)
+{
+    esp_err_t err;
+    nvs_handle_t my_handle;
+
+    err = nvs_open("permenant", NVS_READWRITE, &my_handle);
+    if (err != ESP_OK) return -1;
+
+    err = nvs_get_blob(my_handle, key, data, len);
+    if (err != ESP_OK) {
+        printf("Error reading blob from NVS: %s\n", esp_err_to_name(err));
+        nvs_close(my_handle);
+        return -1;
+    }
+
+    nvs_close(my_handle);
+    return 0;
+}
+
+
+
+int nvs_save_u32_value(const char *key, uint32_t value) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("permanent", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return -1;
+
+    err = nvs_set_u32(handle, key, value);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return -2;
+    }
+
+    err = nvs_commit(handle);
+    nvs_close(handle);
+    return (err == ESP_OK) ? 0 : -3;
+}
+
+int nvs_load_u32_value(const char *key, uint32_t *value) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("permanent", NVS_READONLY, &handle);
+    if (err != ESP_OK) return -1;
+
+    err = nvs_get_u32(handle, key, value);
+    nvs_close(handle);
+    return (err == ESP_OK) ? 0 : -2;
+}
 void nvs_save_wifi_credentials(char *ssid, char *password)
 {
     esp_err_t err = ESP_OK;

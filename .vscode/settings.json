@@ -3,7 +3,7 @@
   "idf.espIdfPath": "/Users/nistantritech/esp/esp-idf",
   "idf.toolsPath": "/Users/nistantritech/.espressif",
   "idf.pythonInstallPath": "/opt/homebrew/bin/python3",
-  "idf.port": "/dev/tty.usbserial-0001",
+  "idf.port": "/dev/tty.usbserial-6",
   "idf.flashType": "UART",
   "files.associations": {
     "esp_event.h": "c",
@@ -22,7 +22,18 @@
     "esp_ble_mesh_provisioning_api.h": "c",
     "custom_characteristic.h": "c",
     "esp_ble_mesh_sensor_model_api.h": "c",
-    "esp_ble_mesh_config_model_api.h": "c"
+    "esp_ble_mesh_config_model_api.h": "c",
+    "array": "c",
+    "memory": "c",
+    "future": "c",
+    "istream": "c",
+    "functional": "c",
+    "tuple": "c",
+    "utility": "c",
+    "esp_system.h": "c",
+    "esp_err.h": "c",
+    "compare": "c",
+    "mesh_handler.h": "c"
   },
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"

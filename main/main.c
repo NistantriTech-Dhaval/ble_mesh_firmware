@@ -5,11 +5,12 @@
 #include <stdbool.h>
 #include "sensor_server.h"
 #include "nvs_manager.h"
+#include "mesh_handler.h"
 static const char *TAG = "main";
 
 void app_main(void)
 {
-    nvs_init();
+    mesh_handler_init();
     sensorserver_main();
     return;
 }

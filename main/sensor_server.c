@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
-
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include <time.h>
@@ -32,12 +31,19 @@
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_sensor_model_api.h"
 #include "esp_ble_mesh_networking_api.h"
+#include "esp_err.h"
+#include "mesh_handler.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "sensor_server.h"
 
 #define CID_ESP 0x02E5
 #define TAG "BLE MESH"
 /* Sensor Property IDs */
 #define SENSOR_PROPERTY_ID_0 0x0056 /* Present Indoor Ambient Temperature */
 #define SENSOR_PROPERTY_ID_1 0x005B /* Present Outdoor Ambient Temperature */
+#define SENSOR_PROPERTY_ID_2 0x0060 /* Present Outdoor Ambient Temperature */
 
 /* Sensor Descriptor Defaults */
 #define SENSOR_POSITIVE_TOLERANCE ESP_BLE_MESH_SENSOR_UNSPECIFIED_POS_TOLERANCE
@@ -55,8 +61,10 @@
  * Min: -64.0, Max: 63.5
  * 0xFF = value unknown
  */
-static int8_t indoor_temp = 40;  /* 20°C */
-static int8_t outdoor_temp = 60; /* 30°C */
+static int8_t indoor_temp = 40;                                /* 20°C */
+static int8_t outdoor_temp = 41;                               /* 30°C */
+uint8_t mac_address[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34}; // dummy 6-byte MAC
+
 /* Last connected address (default invalid) */
 static uint16_t last_connected_addr = 0x0000;
 
@@ -85,17 +93,14 @@ static esp_ble_mesh_cfg_srv_t config_server = {
 /* Raw sensor data buffers */
 NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_0, 1);
 NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_1, 1);
+NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_2, 6);
 
 /* Sensor states (multi-sensor example) */
-static esp_ble_mesh_sensor_state_t sensor_states[2] = {
+static esp_ble_mesh_sensor_state_t sensor_states[3] = {
     [0] = {
         .sensor_property_id = SENSOR_PROPERTY_ID_0,
         .descriptor = {
-            .positive_tolerance = SENSOR_POSITIVE_TOLERANCE,
-            .negative_tolerance = SENSOR_NEGATIVE_TOLERANCE,
-            .sampling_function = SENSOR_SAMPLE_FUNCTION,
-            .measure_period = SENSOR_MEASURE_PERIOD,
-            .update_interval = SENSOR_UPDATE_INTERVAL,
+            .update_interval = 0,
         },
         .sensor_data = {
             .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A,
@@ -106,11 +111,7 @@ static esp_ble_mesh_sensor_state_t sensor_states[2] = {
     [1] = {
         .sensor_property_id = SENSOR_PROPERTY_ID_1,
         .descriptor = {
-            .positive_tolerance = SENSOR_POSITIVE_TOLERANCE,
-            .negative_tolerance = SENSOR_NEGATIVE_TOLERANCE,
-            .sampling_function = SENSOR_SAMPLE_FUNCTION,
-            .measure_period = SENSOR_MEASURE_PERIOD,
-            .update_interval = SENSOR_UPDATE_INTERVAL,
+            .update_interval = 0,
         },
         .sensor_data = {
             .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A,
@@ -118,10 +119,21 @@ static esp_ble_mesh_sensor_state_t sensor_states[2] = {
             .raw_value = &sensor_data_1,
         },
     },
+    [2] = {
+        .sensor_property_id = SENSOR_PROPERTY_ID_2, // New sensor, e.g., Humidity
+        .descriptor = {
+            .update_interval = 0,
+        },
+        .sensor_data = {
+            .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A, .length = 0,
+            .raw_value = &sensor_data_2, // Define NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_2, 1);
+        },
+    },
+
 };
 
 /* Sensor server publication */
-ESP_BLE_MESH_MODEL_PUB_DEFINE(sensor_pub, 20, ROLE_NODE);
+ESP_BLE_MESH_MODEL_PUB_DEFINE(sensor_pub, 100, ROLE_NODE);
 static esp_ble_mesh_sensor_srv_t sensor_server = {
     .rsp_ctrl = {
         .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
@@ -202,6 +214,7 @@ static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32
     /* Initialize the indoor and outdoor temperatures for each sensor.  */
     net_buf_simple_add_u8(&sensor_data_0, indoor_temp);
     net_buf_simple_add_u8(&sensor_data_1, outdoor_temp);
+    net_buf_simple_add_mem(&sensor_data_2, mac_address, 6);
 }
 
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
@@ -210,9 +223,20 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     switch (event)
     {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
+        char node_type[20]; // Array to hold the custom color
+        nvs_get_string_value("node_type", node_type);
+        if (strcmp(node_type, "sensor_server") == 0)
+        {
+            xTaskCreate(store_mac_in_sensor, "store_mac_in_sensor", 2048, NULL, 5, NULL);
+        }
+        else
+        {
+            xTaskCreate(sensor_update_task, "sensor_update_task", 2048, NULL, 5, NULL);
+        }
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
+        xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
         ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT, err_code %d", param->node_prov_enable_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_LINK_OPEN_EVT:
@@ -273,10 +297,12 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
             {
                 char node_type[20]; // Array to hold the custom color
                 nvs_get_string_value("node_type", node_type);
+                ESP_LOGI(TAG, "Current node_type: %s", node_type);
+
                 if (strcmp(node_type, "sensor_server") == 0)
                 {
+                    ESP_LOGI(TAG, "Changing node_type to 'sensor_client'");
                     nvs_save_string_value("node_type", "sensor_client");
-                    wifi_init_sta();
                 }
             }
             break;
@@ -290,10 +316,7 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
             if (param->value.state_change.mod_sub_add.model_id == 0x1102)
             {
                 ESP_LOGI(TAG, "Model 0x1102 unsubscribed — restart esp32...");
-
-                nvs_save_string_value("node_type", "sensor_server");
-                nvs_delete_key("ssid");
-                nvs_delete_key("password");
+                nvs_erase_all_key();
                 esp_restart();
             }
             break;
@@ -541,6 +564,22 @@ static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_pa
     {
         if (param->value.get.sensor_data.property_id == sensor_states[i].sensor_property_id)
         {
+            // Set random value between 0 and 40
+            if (sensor_states[i].sensor_property_id == SENSOR_PROPERTY_ID_0 ||
+                sensor_states[i].sensor_property_id == SENSOR_PROPERTY_ID_1)
+            {
+                if (sensor_states[i].sensor_data.raw_value)
+                {
+                    sensor_states[i].sensor_data.raw_value->data[0] = (uint8_t)(rand() % 41);
+                    sensor_states[i].sensor_data.raw_value->len = 1; // length of your raw value
+                }
+            }
+
+            length = example_ble_mesh_get_sensor_data(&sensor_states[i], status);
+            goto send;
+        }
+        if (param->value.get.sensor_data.property_id == sensor_states[i].sensor_property_id)
+        {
             length = example_ble_mesh_get_sensor_data(&sensor_states[i], status);
             goto send;
         }
@@ -558,7 +597,6 @@ static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_pa
 
 send:
     ESP_LOG_BUFFER_HEX("Sensor Data", status, length);
-
     err = esp_ble_mesh_server_model_send_msg(param->model, &param->ctx,
                                              ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS, length, status);
     if (err != ESP_OK)
@@ -788,31 +826,70 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_GET:
             ESP_LOGI(TAG, "Sensor Status, opcode 0x%04" PRIx32, param->params->ctx.recv_op);
-            if (param->status_cb.sensor_status.marshalled_sensor_data->len)
+            if (param->status_cb.sensor_status.marshalled_sensor_data &&
+                param->status_cb.sensor_status.marshalled_sensor_data->len > 0)
             {
-                ESP_LOG_BUFFER_HEX("Sensor Data", param->status_cb.sensor_status.marshalled_sensor_data->data,
-                                   param->status_cb.sensor_status.marshalled_sensor_data->len);
+                uint16_t unicast_addr = param->params->ctx.addr;
+                ESP_LOGI(TAG, "Sensor status received from server unicast address: 0x%04x", unicast_addr);
+
                 uint8_t *data = param->status_cb.sensor_status.marshalled_sensor_data->data;
+                int len = param->status_cb.sensor_status.marshalled_sensor_data->len;
                 uint16_t length = 0;
-                for (; length < param->status_cb.sensor_status.marshalled_sensor_data->len;)
+
+                while (length < len)
                 {
-                    uint8_t fmt = ESP_BLE_MESH_GET_SENSOR_DATA_FORMAT(data);
-                    uint8_t data_len = ESP_BLE_MESH_GET_SENSOR_DATA_LENGTH(data, fmt);
-                    uint16_t prop_id = ESP_BLE_MESH_GET_SENSOR_DATA_PROPERTY_ID(data, fmt);
+                    uint8_t *chunk = data + length;
+                    uint8_t fmt = ESP_BLE_MESH_GET_SENSOR_DATA_FORMAT(chunk);
+                    uint8_t data_len = ESP_BLE_MESH_GET_SENSOR_DATA_LENGTH(chunk, fmt);
+                    uint16_t prop_id = ESP_BLE_MESH_GET_SENSOR_DATA_PROPERTY_ID(chunk, fmt);
                     uint8_t mpid_len = (fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? ESP_BLE_MESH_SENSOR_DATA_FORMAT_A_MPID_LEN : ESP_BLE_MESH_SENSOR_DATA_FORMAT_B_MPID_LEN);
+
                     ESP_LOGI(TAG, "Format %s, length 0x%02x, Sensor Property ID 0x%04x",
-                             fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? "A" : "B", data_len, prop_id);
+                             fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? "A" : "B",
+                             data_len, prop_id);
+
                     if (data_len != ESP_BLE_MESH_SENSOR_DATA_ZERO_LEN)
                     {
-                        ESP_LOG_BUFFER_HEX("Sensor Data", data + mpid_len, data_len + 1);
-                        length += mpid_len + data_len + 1;
-                        data += mpid_len + data_len + 1;
+                        uint8_t *value_data = chunk + mpid_len;
+                        ESP_LOG_BUFFER_HEX("Sensor Data", value_data, data_len);
+
+                        if (prop_id == SENSOR_PROPERTY_ID_0 || prop_id == SENSOR_PROPERTY_ID_1)
+                        {
+                            int8_t raw_val = value_data[0]; // temp or humidity
+                            uint8_t mac[6];
+
+                            if (mesh_handler_get_mac(unicast_addr, mac) == 0) // ✅ success
+                            {
+                                ESP_LOGI(TAG, "Found MAC for 0x%04X: %02X:%02X:%02X:%02X:%02X:%02X",
+                                         unicast_addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+                                if (prop_id == SENSOR_PROPERTY_ID_0)
+                                    ESP_LOGI(TAG, "Temperature value from 0x%04X: %d°C", unicast_addr, raw_val);
+                                else
+                                    ESP_LOGI(TAG, "Humidity value from 0x%04X: %d%%", unicast_addr, raw_val);
+
+                                char json_params[256];
+                                if (prop_id == SENSOR_PROPERTY_ID_0)
+                                    snprintf(json_params, sizeof(json_params),
+                                             "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
+                                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                             raw_val);
+                                else
+                                    snprintf(json_params, sizeof(json_params),
+                                             "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"humidity\":%d}]}",
+                                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                             raw_val);
+
+                                publish_sensor_data("v1/gateway/telemetry", json_params);
+                            }
+                            else
+                            {
+                                ESP_LOGW(TAG, "No MAC found for unicast 0x%04X", unicast_addr);
+                            }
+                        }
                     }
-                    else
-                    {
-                        length += mpid_len;
-                        data += mpid_len;
-                    }
+
+                    length += mpid_len + data_len + 1;
                 }
             }
             break;
@@ -860,124 +937,66 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
         break;
     case ESP_BLE_MESH_SENSOR_CLIENT_PUBLISH_EVT:
     {
-        ESP_LOGI(TAG, "Received SENSOR_CLIENT_PUBLISH_EVT");
+        ESP_LOGI(TAG, "ESP_BLE_MESH_SENSOR_CLIENT_PUBLISH_EVT");
 
         if (param->status_cb.sensor_status.marshalled_sensor_data &&
             param->status_cb.sensor_status.marshalled_sensor_data->len > 0)
         {
-            ESP_LOGI(TAG, "Sensor status received from server unicast address: 0x%04x", param->params->ctx.addr);
-            uint16_t curr_addr = param->params->ctx.addr;
-            char stored_data[512];
-            nvs_get_string_value("network_info", stored_data);
-            ESP_LOGI(TAG, "Stored custom BLE data: %s", stored_data);
-            char out_name[64];                  // 👈 Declare out_name
-            size_t out_size = sizeof(out_name); // 👈 Declare out_size
-
-            // Convert unicast address (e.g., 0x0006) to string
-            char unicast_key[5];                                           // 4 digits + null
-            snprintf(unicast_key, sizeof(unicast_key), "%04X", curr_addr); // curr_addr is 0x0006
-
-            // Parse JSON
-            cJSON *json = cJSON_Parse(stored_data);
-            if (!json)
-            {
-                ESP_LOGE(TAG, "Failed to parse JSON");
-                return;
-            }
-
-            cJSON *uuid_item = cJSON_GetObjectItemCaseSensitive(json, unicast_key);
-            if (cJSON_IsString(uuid_item) && (uuid_item->valuestring != NULL))
-            {
-                ESP_LOGI(TAG, "UUID for unicast %s: %s", unicast_key, uuid_item->valuestring);
-                // You can now use uuid_item->valuestring as the name
-                snprintf(out_name, out_size, "%s", uuid_item->valuestring);
-            }
-            else
-            {
-                ESP_LOGW(TAG, "UUID not found for unicast %s", unicast_key);
-                ESP_LOGW(TAG, "Available addresses in JSON: %s", stored_data);
-
-                // Use fallback name instead of returning early
-                snprintf(out_name, out_size, "unknown_device_%s", unicast_key);
-                ESP_LOGI(TAG, "Using fallback name: %s", out_name);
-            }
-
-            cJSON_Delete(json);
-
-            if (last_connected_addr != curr_addr)
-            {
-                char json_params[256]; // Increase buffer size
-                snprintf(json_params, sizeof(json_params), "{\"device\": \"%s\"}", out_name);
-
-                publish_sensor_data("v1/gateway/connect", json_params);
-                last_connected_addr = curr_addr;
-            }
-
-            ESP_LOGI(TAG, "Sensor Data Length: %d", param->status_cb.sensor_status.marshalled_sensor_data->len);
-            ESP_LOG_BUFFER_HEX("Sensor Data", param->status_cb.sensor_status.marshalled_sensor_data->data,
-                               param->status_cb.sensor_status.marshalled_sensor_data->len);
+            uint16_t unicast_addr = param->params->ctx.addr;
+            ESP_LOGI(TAG, "Sensor status received from server unicast address: 0x%04x", unicast_addr);
 
             uint8_t *data = param->status_cb.sensor_status.marshalled_sensor_data->data;
-            uint16_t total_len = param->status_cb.sensor_status.marshalled_sensor_data->len;
-            uint16_t offset = 0;
+            int len = param->status_cb.sensor_status.marshalled_sensor_data->len;
+            uint16_t length = 0;
 
-            while (offset < total_len)
+            while (length < len)
             {
                 uint8_t fmt = ESP_BLE_MESH_GET_SENSOR_DATA_FORMAT(data);
                 uint8_t data_len = ESP_BLE_MESH_GET_SENSOR_DATA_LENGTH(data, fmt);
                 uint16_t prop_id = ESP_BLE_MESH_GET_SENSOR_DATA_PROPERTY_ID(data, fmt);
                 uint8_t mpid_len = (fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? ESP_BLE_MESH_SENSOR_DATA_FORMAT_A_MPID_LEN : ESP_BLE_MESH_SENSOR_DATA_FORMAT_B_MPID_LEN);
 
-                ESP_LOGI(TAG, "Format: %s, Data Length: 0x%02x, Property ID: 0x%04x",
+                ESP_LOGI(TAG, "Format %s, length 0x%02x, Sensor Property ID 0x%04x",
                          fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? "A" : "B", data_len, prop_id);
 
                 if (data_len != ESP_BLE_MESH_SENSOR_DATA_ZERO_LEN)
                 {
                     uint8_t *value_data = data + mpid_len;
-
-                    if (prop_id == 0x0056)
-                    { // Temperature
-                        if (data_len + 1 == 1)
-                        {
-                            int8_t raw_temp = value_data[0]; // signed 8-bit
-                            ESP_LOGI(TAG, "Indoor Ambient Temperature (1 byte): %d °C", raw_temp);
-                            char json_params[128]; // Ensure this is large enough for the JSON string
-                            snprintf(json_params, sizeof(json_params), "{\"%s\":[{\"temp\":%d}]}", out_name, raw_temp);
-
-                            publish_sensor_data("v1/gateway/telemetry", json_params);
-                        }
-                    }
-                    else if (prop_id == 0x005B)
-                    { // Humidity
-                        if (data_len + 1 == 1)
-                        {
-                            uint8_t raw_humidity = value_data[0];
-                            ESP_LOGI(TAG, "Humidity (1 byte): %u %%", raw_humidity);
-                            char json_params[128]; // Ensure this is large enough for the JSON string
-                            snprintf(json_params, sizeof(json_params), "{\"%s\":[{\"humidity\":%d}]}", out_name, raw_humidity);
-
-                            publish_sensor_data("v1/gateway/telemetry", json_params);
-                        }
-                    }
-                    else
+                    ESP_LOG_BUFFER_HEX("Sensor Data", data + mpid_len, data_len + 1);
+                    if (prop_id == SENSOR_PROPERTY_ID_2)
                     {
-                        ESP_LOGW(TAG, "Unknown Sensor Property ID: 0x%04X", prop_id);
-                        ESP_LOG_BUFFER_HEX("Raw Sensor Value", value_data, data_len + 1);
-                    }
+                        uint8_t mac[6] = {0};
+                        if (data_len >= 6)
+                        {
+                            memcpy(mac, data + mpid_len, 6);
+                            ESP_LOGI(TAG, "Extracted MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-                    offset += mpid_len + data_len + 1;
+                            // 🔹 Try to add node — skip if already stored
+                            int result = mesh_handler_add_node(unicast_addr, mac);
+                            if (result == 1)
+                            {
+                                ESP_LOGI(TAG, "New node stored: Unicast=0x%04X", unicast_addr);
+                            }
+                            else if (result == 0)
+                            {
+                                ESP_LOGI(TAG, "Node already exists, skipping");
+                            }
+                            else
+                            {
+                                ESP_LOGW(TAG, "Mesh handler storage full, cannot add node!");
+                            }
+                        }
+                    }
+                    length += mpid_len + data_len + 1;
                     data += mpid_len + data_len + 1;
                 }
                 else
                 {
-                    offset += mpid_len;
+                    length += mpid_len;
                     data += mpid_len;
                 }
             }
-        }
-        else
-        {
-            ESP_LOGW(TAG, "Received empty sensor data");
         }
     }
 
@@ -1065,35 +1084,121 @@ static esp_err_t ble_mesh_init(void)
     return ESP_OK;
 }
 
-static void sensor_update_task(void *arg)
+static void store_mac_in_sensor(void *arg)
 {
-    esp_err_t err;
     while (1)
     {
-        // Generate new simulated temperature values (-64 to +63)
-        indoor_temp = (rand() % 50);
-        outdoor_temp = (rand() % 100);
-        // Clear and update sensor data buffers
-        net_buf_simple_reset(&sensor_data_0);
-        net_buf_simple_reset(&sensor_data_1);
-        net_buf_simple_add_u8(&sensor_data_0, indoor_temp);
-        net_buf_simple_add_u8(&sensor_data_1, outdoor_temp);
-        ESP_LOGI(TAG, "Updated: Indoor=%d, Outdoor=%d", indoor_temp, outdoor_temp);
-        // Prepare data buffer for publishing
-        uint8_t status[10]; // large enough for both sensors
-        uint16_t len = 0;
-        len += example_ble_mesh_get_sensor_data(&sensor_states[0], status + len);
-        len += example_ble_mesh_get_sensor_data(&sensor_states[1], status + len);
-        err = esp_ble_mesh_model_publish(sensor_pub.model, ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS, len, status, ROLE_NODE);
-        if (err != ESP_OK)
+        uint8_t *mac = esp_bt_dev_get_address(); // Must be after esp_bluedroid_enable()
+        if (mac)
         {
-            ESP_LOGE(TAG, "Failed to publish sensor data (err %d)", err);
+            ESP_LOGI(TAG, "Bluetooth MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         }
         else
         {
-            ESP_LOGI(TAG, "Sensor data published");
+            ESP_LOGE(TAG, "Failed to get Bluetooth MAC");
         }
-        vTaskDelay(pdMS_TO_TICKS(10000)); // wait 10 seconds
+        net_buf_simple_reset(&sensor_data_2);
+
+        // Store the 6-byte MAC
+        net_buf_simple_add_mem(&sensor_data_2, mac, 6);
+
+        // Update sensor state length
+        sensor_states[2].sensor_data.length = 6;
+
+        ESP_LOGI(TAG, "MAC stored in sensor_data_2: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        // Prepare payload to publish
+        uint8_t status[10]; // buffer for sending sensor data
+        uint16_t len = 0;
+        len += example_ble_mesh_get_sensor_data(&sensor_states[2], status + len);
+
+        esp_err_t err = esp_ble_mesh_model_publish(sensor_pub.model,
+                                                   ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS,
+                                                   len, status, ROLE_NODE);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to publish sensor 2 (err %d)", err);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    } // Update every 60 seconds
+}
+
+static void example_ble_mesh_set_msg_common(esp_ble_mesh_client_common_param_t *common,
+                                            uint16_t unicast_addr,
+                                            esp_ble_mesh_model_t *model,
+                                            uint32_t opcode)
+{
+    common->opcode = opcode;
+    common->model = model;
+    common->ctx.net_idx = 0;
+    common->ctx.app_idx = 0;
+    common->ctx.addr = unicast_addr;
+    common->ctx.send_ttl = 3;
+    common->msg_timeout = 0;
+    common->msg_role = ROLE_NODE;
+}
+
+void example_ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode, uint16_t property_id)
+{
+    esp_ble_mesh_sensor_client_get_state_t get = {0};
+    esp_ble_mesh_client_common_param_t common = {0};
+    esp_err_t err;
+
+    // Prepare message common parameters
+    example_ble_mesh_set_msg_common(&common, unicast_addr, sensor_client.model, opcode);
+
+    // Prepare GET request for specific property ID
+    get.sensor_get.property_id = property_id;
+    get.sensor_get.op_en = true;
+
+    // Send the GET request
+    err = esp_ble_mesh_sensor_client_get_state(&common, &get);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to send SENSOR_GET (property 0x%04x) to node 0x%04x", property_id, unicast_addr);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Sent SENSOR_GET (property 0x%04x) to node 0x%04x", property_id, unicast_addr);
+    }
+}
+
+static void sensor_update_task(void *arg)
+{
+    uint16_t property_ids[] = {
+        SENSOR_PROPERTY_ID_0,
+        SENSOR_PROPERTY_ID_1};
+    size_t property_count = sizeof(property_ids) / sizeof(property_ids[0]);
+
+    while (1)
+    {
+        size_t count = mesh_handler_get_node_count();
+        ESP_LOGI(TAG, "Starting periodic sensor read for %zu nodes", count);
+
+        for (size_t i = 0; i < count; i++)
+        {
+            uint16_t unicast_addr;
+            uint8_t mac[6];
+            if (mesh_handler_get_node_info(i, &unicast_addr, mac))
+            {
+                ESP_LOGI(TAG, "Requesting sensor data from node 0x%04x", unicast_addr);
+
+                for (size_t j = 0; j < property_count; j++)
+                {
+                    example_ble_mesh_send_sensor_message(
+                        unicast_addr,
+                        ESP_BLE_MESH_MODEL_OP_SENSOR_GET,
+                        property_ids[j]);
+                    vTaskDelay(pdMS_TO_TICKS(1000)); // short gap between messages
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        // Wait 5 minutes before next round
+        vTaskDelay(pdMS_TO_TICKS(60000));
     }
 }
 
@@ -1108,18 +1213,22 @@ void sensorserver_main(void)
         ESP_LOGE(TAG, "esp32_bluetooth_init failed (err %d)", err);
         return;
     }
-
-    ble_mesh_get_dev_uuid(dev_uuid);
-
-    /* Initialize the Bluetooth Mesh Subsystem */
-    err = ble_mesh_init();
-    if (err)
+    char mesh_type[20]; // Array to hold the custom color
+    nvs_get_string_value("mesh_type", mesh_type);
+    if (strcmp(mesh_type, "mesh_node") == 0 || strcmp(mesh_type, "mesh_gateway") == 0)
     {
-        ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
+
+        ble_mesh_get_dev_uuid(dev_uuid);
+
+        /* Initialize the Bluetooth Mesh Subsystem */
+        err = ble_mesh_init();
+        if (err)
+        {
+            ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
+        }
     }
-    srand((unsigned int)time(NULL));
-    xTaskCreate(sensor_update_task, "sensor_sim_task", 2048, NULL, 5, NULL);
-    printf("Starting wifi");
+    else
+    {
+    }
     wifi_init_sta();
-    xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
 }
