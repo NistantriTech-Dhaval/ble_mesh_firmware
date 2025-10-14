@@ -37,6 +37,7 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "sensor_server.h"
+#include "proxy_server.h"
 
 #define CID_ESP 0x02E5
 #define TAG "BLE MESH"
@@ -1226,9 +1227,17 @@ void sensorserver_main(void)
         {
             ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
         }
-    }
-    else
-    {
+        const uint8_t *mac = esp_bt_dev_get_address();
+        ESP_LOGI(TAG, "ESP32 BLE MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        // Create a unique name based on MAC
+        char mesh_name[30];
+        snprintf(mesh_name, sizeof(mesh_name),
+                 "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        bt_mesh_set_device_name(mesh_name);
     }
     wifi_init_sta();
 }
