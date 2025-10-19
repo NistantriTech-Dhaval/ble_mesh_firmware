@@ -11,6 +11,6 @@ static const char *TAG = "main";
 void app_main(void)
 {
     mesh_handler_init();
-    sensorserver_main();
+    ble_mesh_main();
     return;
 }

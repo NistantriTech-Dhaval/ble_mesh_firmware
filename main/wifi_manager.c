@@ -10,35 +10,43 @@
 #include <wifi_provisioning/manager.h>
 #include <wifi_provisioning/scheme_ble.h>
 #include "wifi_manager.h"
-#define TAG "WIFI"
-static bool reconnect = true;
-static bool wifi_started = false;
-static int reconnect_attempt = 0;
-wifi_ap_record_t g_ap_list[MAX_AP_NUM];
-uint16_t g_ap_count = 0;
-uint16_t wifi_read_index = 0;
-uint16_t wifi_total_len = 0;
-char wifi_buffer[1024]; // buffer containing all SSIDs
 
+#define TAG "WIFI"
+
+// Global flags and variables
+static bool reconnect = true;          // Should Wi-Fi reconnect automatically on disconnect
+static bool wifi_started = false;      // To prevent multiple Wi-Fi initialization
+static int reconnect_attempt = 0;      // Counter for exponential backoff on reconnect
+
+wifi_ap_record_t g_ap_list[MAX_AP_NUM]; // Stores scanned APs
+uint16_t g_ap_count = 0;                // Number of APs found
+uint16_t wifi_read_index = 0;           // Index for reading Wi-Fi buffer in chunks
+uint16_t wifi_total_len = 0;            // Total length of Wi-Fi buffer
+char wifi_buffer[1024];                 // Buffer containing all SSIDs
+
+// Event handler for Wi-Fi and IP events
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
 {
+    // Wi-Fi station started
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
     {
         esp_wifi_connect();
     }
+    // Wi-Fi scan completed
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE)
     {
         ESP_LOGI(TAG, "sta scan done");
     }
+    // Wi-Fi disconnected
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         if (reconnect)
         {
             reconnect_attempt++;
-            int delay_ms = 1000 * reconnect_attempt; // 1s, 2s, 3s...
+            int delay_ms = 1000 * reconnect_attempt; // Exponential backoff: 1s, 2s, 3s...
             if (delay_ms > 30000)
-                delay_ms = 30000; // cap at 30s
+                delay_ms = 30000; // Cap at 30s
 
             ESP_LOGI(TAG, "sta disconnect, retry in %d ms...", delay_ms);
 
@@ -50,24 +58,27 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "sta disconnect (no reconnect)");
         }
     }
+    // IP assigned
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        mqtt_app_start();
+        mqtt_app_start(); // Start MQTT after getting IP
     }
 }
+
+// Build a comma-separated Wi-Fi SSID list in wifi_buffer
 void build_wifi_list()
 {
-    int offset = 1;  // start from 1 to leave space for length byte
+    int offset = 1;  // Start from 1 to leave space for length byte
 
     for (int i = 0; i < g_ap_count; i++)
     {
-        char ssid[33]; // max SSID length + null
+        char ssid[33]; // max SSID length + null terminator
         memcpy(ssid, g_ap_list[i].ssid, 32);
         ssid[32] = '\0'; // ensure null termination
 
-        // remove trailing spaces and nulls
+        // Remove trailing spaces and null characters
         for(int j = 31; j >= 0; j--){
             if(ssid[j] == ' ' || ssid[j] == '\0') ssid[j] = '\0';
             else break;
@@ -76,10 +87,12 @@ void build_wifi_list()
         // Skip empty SSIDs
         if(strlen(ssid) == 0) continue;
 
+        // Append SSID + comma to buffer
         int n = snprintf((char *)(wifi_buffer + offset), sizeof(wifi_buffer) - offset,
                          "%s,", ssid);
         if (n < 0 || offset + n >= sizeof(wifi_buffer))
             break;
+
         offset += n;
     }
 
@@ -90,25 +103,27 @@ void build_wifi_list()
         wifi_buffer[1] = '\0'; // empty buffer after length byte
     }
 
-    // First byte = remaining length after first byte
+    // First byte indicates remaining length after first byte
     wifi_buffer[0] = offset - 1;
 
     wifi_total_len = offset;
-    wifi_read_index = 0; // reset index
+    wifi_read_index = 0; // reset index for GATT read
 
     ESP_LOGI(TAG, "Wi-Fi list built, total len=%d, remaining=%d", wifi_total_len, wifi_buffer[0]);
 }
 
+// FreeRTOS task to scan Wi-Fi periodically
 void wifi_scan_task(void *pvParameter)
 {
     wifi_scan_config_t scan_config = {
         .ssid = NULL,
         .bssid = NULL,
-        .channel = 0,      // scan all channels
+        .channel = 0,      // Scan all channels
         .show_hidden = true
     };
 
     while (1) {
+        // Start Wi-Fi scan (blocking)
         esp_err_t err = esp_wifi_scan_start(&scan_config, true);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Scan start failed: %d", err);
@@ -122,22 +137,27 @@ void wifi_scan_task(void *pvParameter)
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
-        if (ap_count > MAX_AP_NUM) ap_count = MAX_AP_NUM; // limit
+        // Limit AP count to MAX_AP_NUM
+        if (ap_count > MAX_AP_NUM) ap_count = MAX_AP_NUM;
 
+        // Temporary list to fetch scan results
         wifi_ap_record_t temp_list[MAX_AP_NUM];
         esp_wifi_scan_get_ap_records(&ap_count, temp_list);
 
-        // Atomically copy to global variable
+        // Copy scan results atomically to global variable
         memcpy(g_ap_list, temp_list, sizeof(wifi_ap_record_t) * ap_count);
         g_ap_count = ap_count; // update count last
 
         ESP_LOGI(TAG, "Found %d APs", ap_count);
+
+        // Build buffer for BLE GATT read
         build_wifi_list();
 
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 5 sec delay
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Delay 10s before next scan
     }
 }
 
+// Initialize Wi-Fi in station mode
 void wifi_init_sta(void)
 {
     if (wifi_started)
@@ -148,9 +168,11 @@ void wifi_init_sta(void)
 
     char ssid[32];
     char password[64];
+    // Read saved Wi-Fi credentials from NVS
     esp_err_t err = nvs_get_wifi_credentials(ssid, password);
     if (err != ESP_OK || strlen(ssid) == 0 || strlen(password) == 0)
     {
+        // No credentials found, just init Wi-Fi stack
         esp_netif_init();
         esp_event_loop_create_default();
         esp_netif_create_default_wifi_sta();
@@ -163,8 +185,7 @@ void wifi_init_sta(void)
     }
     else
     {
-
-        // Initialize netif
+        // Initialize network interface
         err = esp_netif_init();
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
         {
@@ -178,14 +199,14 @@ void wifi_init_sta(void)
             ESP_ERROR_CHECK(err);
         }
 
-        // Create default Wi-Fi STA netif
+        // Create default Wi-Fi STA network interface
         esp_netif_create_default_wifi_sta();
 
-        // ✅ INIT WIFI (required!)
+        // Initialize Wi-Fi driver
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg)); // ← THIS was missing
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-        // Register event handlers
+        // Register event handlers for Wi-Fi and IP events
         esp_event_handler_instance_t instance_any_id;
         esp_event_handler_instance_t instance_got_ip;
         ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
@@ -199,7 +220,7 @@ void wifi_init_sta(void)
                                                             NULL,
                                                             &instance_got_ip));
 
-        // Log and set Wi-Fi config
+        // Set Wi-Fi configuration with stored credentials
         ESP_LOGI(TAG, "Using stored Wi-Fi credentials: SSID: %s", ssid);
         wifi_config_t wifi_config = {};
         strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
@@ -209,7 +230,7 @@ void wifi_init_sta(void)
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         ESP_ERROR_CHECK(esp_wifi_start());
 
-        wifi_started = true; // ✅ Mark as started
+        wifi_started = true; // Mark Wi-Fi as started
         ESP_LOGI(TAG, "wifi_init_sta finished. Connecting to SSID: %s", ssid);
     }
 }

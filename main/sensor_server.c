@@ -39,35 +39,26 @@
 #include "sensor_server.h"
 #include "proxy_server.h"
 
+/* Company ID for ESP */
 #define CID_ESP 0x02E5
+ 
+// Logging tag for ESP32 logging messages
 #define TAG "BLE MESH"
-/* Sensor Property IDs */
-#define SENSOR_PROPERTY_ID_0 0x0056 /* Present Indoor Ambient Temperature */
-#define SENSOR_PROPERTY_ID_1 0x005B /* Present Outdoor Ambient Temperature */
-#define SENSOR_PROPERTY_ID_2 0x0060 /* Present Outdoor Ambient Temperature */
 
-/* Sensor Descriptor Defaults */
-#define SENSOR_POSITIVE_TOLERANCE ESP_BLE_MESH_SENSOR_UNSPECIFIED_POS_TOLERANCE
-#define SENSOR_NEGATIVE_TOLERANCE ESP_BLE_MESH_SENSOR_UNSPECIFIED_NEG_TOLERANCE
-#define SENSOR_SAMPLE_FUNCTION ESP_BLE_MESH_SAMPLE_FUNC_UNSPECIFIED
-#define SENSOR_MEASURE_PERIOD ESP_BLE_MESH_SENSOR_NOT_APPL_MEASURE_PERIOD
-#define SENSOR_UPDATE_INTERVAL ESP_BLE_MESH_SENSOR_NOT_APPL_UPDATE_INTERVAL
+/* Sensor Property IDs */
+#define TEMP_PROPERTY_ID_0 0x0056 /* Present Temperature */
+#define HUM_PROPERTY_ID_1 0x005B  /* Present Humidity */
+#define MAC_PROPERTY_ID_2 0x0060  /* Device MAC Address or Identifier */
+
 /* Vendor model */
 #define ESP_BLE_MESH_VND_MODEL_ID_SERVER 0x0001
 #define ESP_BLE_MESH_VND_MODEL_OP_SEND ESP_BLE_MESH_MODEL_OP_3(0x00, CID_ESP)
 #define ESP_BLE_MESH_VND_MODEL_OP_STATUS ESP_BLE_MESH_MODEL_OP_3(0x01, CID_ESP)
 
-/* Temperature 8 characteristic:
- * Unit: 0.5 degree Celsius
- * Min: -64.0, Max: 63.5
- * 0xFF = value unknown
- */
-static int8_t indoor_temp = 40;                                /* 20°C */
-static int8_t outdoor_temp = 41;                               /* 30°C */
-uint8_t mac_address[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34}; // dummy 6-byte MAC
-
-/* Last connected address (default invalid) */
-static uint16_t last_connected_addr = 0x0000;
+/* Property values (simulated or default) */
+static int8_t temperature = 40;                            
+static int8_t humidity = 41;                               
+uint8_t mac_address[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // dummy 6-byte MAC
 
 /* Device UUID (16 octets) */
 static uint8_t dev_uuid[ESP_BLE_MESH_OCTET16_LEN] = {0x32, 0x10};
@@ -92,91 +83,128 @@ static esp_ble_mesh_cfg_srv_t config_server = {
 };
 
 /* Raw sensor data buffers */
-NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_0, 1);
-NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_1, 1);
-NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_2, 6);
+NET_BUF_SIMPLE_DEFINE_STATIC(temperature_data_0, 1);
+NET_BUF_SIMPLE_DEFINE_STATIC(humidity_data_1, 1);
+NET_BUF_SIMPLE_DEFINE_STATIC(mac_address_data_2, 6);
 
 /* Sensor states (multi-sensor example) */
 static esp_ble_mesh_sensor_state_t sensor_states[3] = {
+    /* 0: Temperature sensor */
     [0] = {
-        .sensor_property_id = SENSOR_PROPERTY_ID_0,
+        .sensor_property_id = TEMP_PROPERTY_ID_0,
         .descriptor = {
             .update_interval = 0,
         },
         .sensor_data = {
             .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A,
             .length = 0, /* 0 = 1 octet */
-            .raw_value = &sensor_data_0,
+            .raw_value = &temperature_data_0,
         },
     },
+    /* 1: Humidity sensor */
     [1] = {
-        .sensor_property_id = SENSOR_PROPERTY_ID_1,
+        .sensor_property_id = HUM_PROPERTY_ID_1,
         .descriptor = {
             .update_interval = 0,
         },
         .sensor_data = {
             .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A,
             .length = 0,
-            .raw_value = &sensor_data_1,
+            .raw_value = &humidity_data_1,
         },
     },
+    /* 2: Device MAC / Identifier */
     [2] = {
-        .sensor_property_id = SENSOR_PROPERTY_ID_2, // New sensor, e.g., Humidity
+        .sensor_property_id = MAC_PROPERTY_ID_2,
         .descriptor = {
             .update_interval = 0,
         },
         .sensor_data = {
-            .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A, .length = 0,
-            .raw_value = &sensor_data_2, // Define NET_BUF_SIMPLE_DEFINE_STATIC(sensor_data_2, 1);
+            .format = ESP_BLE_MESH_SENSOR_DATA_FORMAT_A,
+            .length = 0,
+            .raw_value = &mac_address_data_2,
         },
     },
 
 };
 
-/* Sensor server publication */
+/* ================= Sensor Server Definition ================= */
+
+/* Sensor server publication context */
 ESP_BLE_MESH_MODEL_PUB_DEFINE(sensor_pub, 100, ROLE_NODE);
+
+/* Standard Sensor Server */
 static esp_ble_mesh_sensor_srv_t sensor_server = {
     .rsp_ctrl = {
-        .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
-        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
+        .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP, // Application handles GET responses
+        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP, // Application handles SET responses
     },
-    .state_count = ARRAY_SIZE(sensor_states),
-    .states = sensor_states,
+    .state_count = ARRAY_SIZE(sensor_states), // Number of sensor states supported
+    .states = sensor_states,                  // Pointer to sensor states array
 };
 
-/* Sensor setup server */
+/* ================= Sensor Setup Server Definition ================= */
+
+/* Sensor setup server publication context */
 ESP_BLE_MESH_MODEL_PUB_DEFINE(sensor_setup_pub, 20, ROLE_NODE);
+
+/* Sensor Setup Server */
 static esp_ble_mesh_sensor_setup_srv_t sensor_setup_server = {
     .rsp_ctrl = {
-        .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
-        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
+        .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP, // Application handles GET responses
+        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP, // Application handles SET responses
     },
-    .state_count = ARRAY_SIZE(sensor_states),
-    .states = sensor_states,
+    .state_count = ARRAY_SIZE(sensor_states), // Number of sensor states supported
+    .states = sensor_states,                  // Pointer to sensor states array
 };
 
+/* ================= Vendor Model Definition ================= */
+
+/* Vendor model operations (opcodes) */
 static esp_ble_mesh_model_op_t vnd_op[] = {
     ESP_BLE_MESH_MODEL_OP(ESP_BLE_MESH_VND_MODEL_OP_SEND, 1),
     ESP_BLE_MESH_MODEL_OP_END,
 };
 
+/* Vendor models array */
 static esp_ble_mesh_model_t vnd_models[] = {
-    ESP_BLE_MESH_VENDOR_MODEL(CID_ESP, ESP_BLE_MESH_VND_MODEL_ID_SERVER,
-                              vnd_op, NULL, NULL),
+    ESP_BLE_MESH_VENDOR_MODEL(
+        CID_ESP,                          // Company ID (ESP)
+        ESP_BLE_MESH_VND_MODEL_ID_SERVER, // Vendor model ID (server)
+        vnd_op,                           // Operations supported by this model
+        NULL,                             // Pointer to model publication context (not used here)
+        NULL                              // Pointer to user data (can be NULL)
+        ),
 };
 
-/* Root element models */
-static esp_ble_mesh_client_t sensor_client;
-static esp_ble_mesh_model_t root_models[] = {
-    ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
-    ESP_BLE_MESH_MODEL_SENSOR_SRV(&sensor_pub, &sensor_server),
-    ESP_BLE_MESH_MODEL_SENSOR_SETUP_SRV(&sensor_setup_pub, &sensor_setup_server),
-    ESP_BLE_MESH_MODEL_SENSOR_CLI(NULL, &sensor_client)};
+/* ================= Root Element Models ================= */
 
-/* Elements and composition */
+/* Client instance for sensor messages */
+static esp_ble_mesh_client_t sensor_client;
+
+/* Root element models for this node */
+static esp_ble_mesh_model_t root_models[] = {
+    ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),                                   // Configuration server model
+    ESP_BLE_MESH_MODEL_SENSOR_SRV(&sensor_pub, &sensor_server),                   // Standard sensor server
+    ESP_BLE_MESH_MODEL_SENSOR_SETUP_SRV(&sensor_setup_pub, &sensor_setup_server), // Sensor setup server
+    ESP_BLE_MESH_MODEL_SENSOR_CLI(NULL, &sensor_client)                           // Sensor client model
+};
+
+/* ================= Elements and Composition ================= */
+/* Define elements for the node
+ * Each element can contain multiple models (standard and vendor).
+ * In this project, the root element contains both root_models and vendor models.
+ */
 static esp_ble_mesh_elem_t elements[] = {
     ESP_BLE_MESH_ELEMENT(0, root_models, vnd_models),
 };
+
+/* Composition data
+ * Describes the node composition for provisioning.
+ * - cid: Company ID (ESP)
+ * - element_count: Number of elements
+ * - elements: Pointer to elements array
+ */
 
 static esp_ble_mesh_comp_t composition = {
     .cid = CID_ESP,
@@ -184,59 +212,103 @@ static esp_ble_mesh_comp_t composition = {
     .elements = elements,
 };
 
-/* Provisioning */
+/* ================= Provisioning Information ================= */
+
+/* Provisioning settings
+ * - uuid: Unique device UUID used for identification during provisioning
+ */
 static esp_ble_mesh_prov_t provision = {
     .uuid = dev_uuid,
 };
 
-/* Packed structures for custom descriptors and settings */
-struct example_sensor_descriptor
+/* ================= Custom Sensor Descriptor ================= */
+/* Packed structure for a sensor descriptor
+ * Provides additional settings for sensor states such as tolerance, sampling, and update interval
+ */
+struct custom_sensor_descriptor
 {
-    uint16_t sensor_prop_id;
-    uint32_t pos_tolerance : 12;
-    uint32_t neg_tolerance : 12;
-    uint32_t sample_func : 8;
-    uint8_t measure_period;
-    uint8_t update_interval;
+    uint16_t sensor_prop_id;     // Sensor property ID
+    uint32_t pos_tolerance : 12; // Positive tolerance
+    uint32_t neg_tolerance : 12; // Negative tolerance
+    uint32_t sample_func : 8;    // Sampling function
+    uint8_t measure_period;      // Measurement period in seconds
+    uint8_t update_interval;     // Update interval in seconds
 } __attribute__((packed));
 
-struct example_sensor_setting
+/* ================= Custom Sensor Setting ================= */
+/* Packed structure for a sensor setting
+ * Maps a sensor property to its corresponding setting property.
+ * Used to configure adjustable sensor parameters in BLE Mesh.
+ */
+struct custom_sensor_setting
 {
-    uint16_t sensor_prop_id;
-    uint16_t sensor_setting_prop_id;
+    uint16_t sensor_prop_id;         // Sensor property ID
+    uint16_t sensor_setting_prop_id; // Corresponding setting property ID
 } __attribute__((packed));
 
+/* ================= Provisioning Complete Callback ================= */
+/* This function is called when a node has been successfully provisioned
+ * into the BLE Mesh network.
+ *
+ * Parameters:
+ *   net_idx   - Network index assigned to the node
+ *   addr      - Unicast address assigned to the node
+ *   flags     - Network flags (Relay, Proxy, Friend, Low Power)
+ *   iv_index  - Current Initialization Vector (IV) index
+ */
 static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32_t iv_index)
 {
     ESP_LOGI(TAG, "net_idx 0x%03x, addr 0x%04x", net_idx, addr);
     ESP_LOGI(TAG, "flags 0x%02x, iv_index 0x%08" PRIx32, flags, iv_index);
+    // Turn off the green LED to indicate provisioning has completed
     board_led_operation(LED_G, LED_OFF);
 
-    /* Initialize the indoor and outdoor temperatures for each sensor.  */
-    net_buf_simple_add_u8(&sensor_data_0, indoor_temp);
-    net_buf_simple_add_u8(&sensor_data_1, outdoor_temp);
-    net_buf_simple_add_mem(&sensor_data_2, mac_address, 6);
+    /* Initialize sensor data buffers for the provisioned node */
+
+    // Add temperature to the buffer (1 byte)
+    net_buf_simple_add_u8(&temperature_data_0, temperature);
+
+    // Add humidity to the buffer (1 byte)
+    net_buf_simple_add_u8(&humidity_data_1, humidity);
+
+    // Add MAC address to the buffer (6 bytes)
+    net_buf_simple_add_mem(&mac_address_data_2, mac_address, 6);
 }
 
-static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
-                                             esp_ble_mesh_prov_cb_param_t *param)
+/* ================= BLE Mesh Provisioning Callback ================= */
+/* This function handles various BLE Mesh provisioning events for the node.
+ * It is called by the ESP BLE Mesh stack whenever a provisioning-related
+ * event occurs.
+ */
+static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
+                                     esp_ble_mesh_prov_cb_param_t *param)
 {
     switch (event)
     {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
+        /* Node registration complete event
+         * Check node type from NVS ("sensor_server" or other)
+         * - If node, start a task to store MAC address
+         * - If gateway, start periodic sensor update task
+         */
         char node_type[20]; // Array to hold the custom color
         nvs_get_string_value("node_type", node_type);
         if (strcmp(node_type, "sensor_server") == 0)
         {
+            // For sensor server nodes, start a task to store MAC address
             xTaskCreate(store_mac_in_sensor, "store_mac_in_sensor", 2048, NULL, 5, NULL);
         }
         else
         {
+            // Start task to request sensor data from other nodes periodically
             xTaskCreate(sensor_update_task, "sensor_update_task", 2048, NULL, 5, NULL);
         }
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
+        /* Provisioning enable complete event
+         * Start Wi-Fi scan task after provisioning is enabled
+         */
         xTaskCreate(&wifi_scan_task, "wifi_scan_task", 4096, NULL, 5, NULL);
         ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT, err_code %d", param->node_prov_enable_comp.err_code);
         break;
@@ -265,8 +337,21 @@ static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     }
 }
 
-static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t event,
-                                              esp_ble_mesh_cfg_server_cb_param_t *param)
+/**
+ * @brief Callback for BLE Mesh Configuration Server events
+ *
+ * Handles configuration events like:
+ * - Adding an AppKey (ESP_BLE_MESH_MODEL_OP_APP_KEY_ADD)
+ * - Binding a model to an AppKey (ESP_BLE_MESH_MODEL_OP_MODEL_APP_BIND)
+ * - Subscribing/unsubscribing models to groups (ESP_BLE_MESH_MODEL_OP_MODEL_SUB_ADD / DELETE)
+ *
+ * Why this callback is necessary:
+ * The configuration server manages provisioning, AppKey binding, and subscription states
+ * in a BLE Mesh node. It allows the device to react to configuration changes, e.g.,
+ * promoting a sensor server to sensor client or erasing NVS if unsubscribed.
+ */
+static void ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t event,
+                                      esp_ble_mesh_cfg_server_cb_param_t *param)
 {
     if (event == ESP_BLE_MESH_CFG_SERVER_STATE_CHANGE_EVT)
     {
@@ -300,6 +385,7 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
                 nvs_get_string_value("node_type", node_type);
                 ESP_LOGI(TAG, "Current node_type: %s", node_type);
 
+                // If this node was a sensor server, promote it to sensor client (gateway role)
                 if (strcmp(node_type, "sensor_server") == 0)
                 {
                     ESP_LOGI(TAG, "Changing node_type to 'sensor_client'");
@@ -314,6 +400,9 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
                      param->value.state_change.mod_sub_add.sub_addr,
                      param->value.state_change.mod_sub_add.company_id,
                      param->value.state_change.mod_sub_add.model_id);
+            // If the unsubscribed model is 0x1102, erase NVS and restart.
+            // This effectively converts a gateway back into a standard node.
+
             if (param->value.state_change.mod_sub_add.model_id == 0x1102)
             {
                 ESP_LOGI(TAG, "Model 0x1102 unsubscribed — restart esp32...");
@@ -327,9 +416,16 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
     }
 }
 
-static void example_ble_mesh_send_sensor_descriptor_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Descriptor Status message in response to Sensor Descriptor Get
+ *
+ * Why this callback is necessary:
+ * Sensor servers need to respond to descriptor queries from clients. This function
+ * generates the descriptor payload for all sensors or a specific sensor property.
+ */
+static void ble_mesh_send_sensor_descriptor_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
-    struct example_sensor_descriptor descriptor = {0};
+    struct custom_sensor_descriptor descriptor = {0};
     uint8_t *status = NULL;
     uint16_t length = 0;
     esp_err_t err;
@@ -401,7 +497,14 @@ send:
     free(status);
 }
 
-static void example_ble_mesh_send_sensor_cadence_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Cadence Status message
+ *
+ * Why this callback is necessary:
+ * Sends cadence (reporting rate) information for a sensor when requested. Currently,
+ * cadence is not supported, but a placeholder message is sent to comply with Mesh spec.
+ */
+static void ble_mesh_send_sensor_cadence_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     esp_err_t err;
 
@@ -416,7 +519,14 @@ static void example_ble_mesh_send_sensor_cadence_status(esp_ble_mesh_sensor_serv
     }
 }
 
-static void example_ble_mesh_send_sensor_settings_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Settings Status message
+ *
+ * Why this callback is necessary:
+ * Sensor clients may request the list of settings available for a sensor. Currently,
+ * settings are not supported, but this function sends a placeholder response.
+ */
+static void ble_mesh_send_sensor_settings_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     esp_err_t err;
 
@@ -431,9 +541,16 @@ static void example_ble_mesh_send_sensor_settings_status(esp_ble_mesh_sensor_ser
     }
 }
 
-static void example_ble_mesh_send_sensor_setting_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Setting Status message
+ *
+ * Why this callback is necessary:
+ * Responds to a client querying a specific sensor setting, including access and raw data
+ * if available. Ensures the server adheres to the Mesh Model specification.
+ */
+static void ble_mesh_send_sensor_setting_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
-    struct example_sensor_setting setting = {0};
+    struct custom_sensor_setting setting = {0};
     esp_err_t err;
 
     /* Mesh Model Spec:
@@ -455,7 +572,14 @@ static void example_ble_mesh_send_sensor_setting_status(esp_ble_mesh_sensor_serv
     }
 }
 
-static uint16_t example_ble_mesh_get_sensor_data(esp_ble_mesh_sensor_state_t *state, uint8_t *data)
+/**
+ * @brief Get Marshalled Sensor Data for a single sensor
+ *
+ * Why this function is necessary:
+ * Converts a sensor's internal data into the BLE Mesh Marshalled Sensor Data format,
+ * including the Property ID and raw value, for sending over the mesh network.
+ */
+static uint16_t ble_mesh_get_sensor_data(esp_ble_mesh_sensor_state_t *state, uint8_t *data)
 {
     uint8_t mpid_len = 0, data_len = 0;
     uint32_t mpid = 0;
@@ -495,7 +619,14 @@ static uint16_t example_ble_mesh_get_sensor_data(esp_ble_mesh_sensor_state_t *st
     return (mpid_len + data_len);
 }
 
-static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Data Status message
+ *
+ * Why this callback is necessary:
+ * Handles responses to Sensor Get messages from clients. Supports requests for all
+ * properties or a specific property, including random temp/humidity simulation.
+ */
+static void ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     uint8_t *status = NULL;
     uint16_t buf_size = 0;
@@ -552,7 +683,7 @@ static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_pa
          */
         for (i = 0; i < ARRAY_SIZE(sensor_states); i++)
         {
-            length += example_ble_mesh_get_sensor_data(&sensor_states[i], status + length);
+            length += ble_mesh_get_sensor_data(&sensor_states[i], status + length);
         }
         goto send;
     }
@@ -566,8 +697,8 @@ static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_pa
         if (param->value.get.sensor_data.property_id == sensor_states[i].sensor_property_id)
         {
             // Set random value between 0 and 40
-            if (sensor_states[i].sensor_property_id == SENSOR_PROPERTY_ID_0 ||
-                sensor_states[i].sensor_property_id == SENSOR_PROPERTY_ID_1)
+            if (sensor_states[i].sensor_property_id == TEMP_PROPERTY_ID_0 ||
+                sensor_states[i].sensor_property_id == HUM_PROPERTY_ID_1)
             {
                 if (sensor_states[i].sensor_data.raw_value)
                 {
@@ -576,12 +707,12 @@ static void example_ble_mesh_send_sensor_status(esp_ble_mesh_sensor_server_cb_pa
                 }
             }
 
-            length = example_ble_mesh_get_sensor_data(&sensor_states[i], status);
+            length = ble_mesh_get_sensor_data(&sensor_states[i], status);
             goto send;
         }
         if (param->value.get.sensor_data.property_id == sensor_states[i].sensor_property_id)
         {
-            length = example_ble_mesh_get_sensor_data(&sensor_states[i], status);
+            length = ble_mesh_get_sensor_data(&sensor_states[i], status);
             goto send;
         }
     }
@@ -607,7 +738,15 @@ send:
     free(status);
 }
 
-static void example_ble_mesh_send_sensor_column_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Column Status message
+ *
+ * Why this callback is necessary:
+ * Responds to Sensor Column Get messages, sending the requested X-axis raw value
+ * for the column. Allows clients to get columnar sensor data from the server.
+ */
+
+static void ble_mesh_send_sensor_column_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     uint8_t *status = NULL;
     uint16_t length = 0;
@@ -635,7 +774,14 @@ static void example_ble_mesh_send_sensor_column_status(esp_ble_mesh_sensor_serve
     free(status);
 }
 
-static void example_ble_mesh_send_sensor_series_status(esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Send Sensor Series Status message
+ *
+ * Why this callback is necessary:
+ * Responds to Sensor Series Get messages, sending the requested series data for a
+ * specific property ID. Placeholder implementation currently.
+ */
+static void ble_mesh_send_sensor_series_status(esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     esp_err_t err;
 
@@ -649,8 +795,19 @@ static void example_ble_mesh_send_sensor_series_status(esp_ble_mesh_sensor_serve
     }
 }
 
-static void example_ble_mesh_sensor_server_cb(esp_ble_mesh_sensor_server_cb_event_t event,
-                                              esp_ble_mesh_sensor_server_cb_param_t *param)
+/**
+ * @brief Sensor Server callback
+ *
+ * Handles all server-side sensor events:
+ * - Receiving GET messages for descriptors, data, cadence, settings, columns, series
+ * - Receiving SET messages for cadence or settings
+ *
+ * Why this callback is necessary:
+ * BLE Mesh sensor servers must respond to clients querying or setting sensor data.
+ * This central callback dispatches the correct handler for each opcode/event type.
+ */
+static void ble_mesh_sensor_server_cb(esp_ble_mesh_sensor_server_cb_event_t event,
+                                      esp_ble_mesh_sensor_server_cb_param_t *param)
 {
     ESP_LOGI(TAG, "Sensor server, event %d, src 0x%04x, dst 0x%04x, model_id 0x%04x",
              event, param->ctx.addr, param->ctx.recv_dst, param->model->model_id);
@@ -662,31 +819,31 @@ static void example_ble_mesh_sensor_server_cb(esp_ble_mesh_sensor_server_cb_even
         {
         case ESP_BLE_MESH_MODEL_OP_SENSOR_DESCRIPTOR_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_DESCRIPTOR_GET");
-            example_ble_mesh_send_sensor_descriptor_status(param);
+            ble_mesh_send_sensor_descriptor_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_GET");
-            example_ble_mesh_send_sensor_cadence_status(param);
+            ble_mesh_send_sensor_cadence_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_SETTINGS_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_SETTINGS_GET");
-            example_ble_mesh_send_sensor_settings_status(param);
+            ble_mesh_send_sensor_settings_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_SETTING_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_SETTINGS_GET");
-            example_ble_mesh_send_sensor_setting_status(param);
+            ble_mesh_send_sensor_setting_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_GET");
-            example_ble_mesh_send_sensor_status(param);
+            ble_mesh_send_sensor_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_COLUMN_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_COLUMN_GET");
-            example_ble_mesh_send_sensor_column_status(param);
+            ble_mesh_send_sensor_column_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_SERIES_GET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_SERIES_GET");
-            example_ble_mesh_send_sensor_series_status(param);
+            ble_mesh_send_sensor_series_status(param);
             break;
         default:
             ESP_LOGE(TAG, "Unknown Sensor Get opcode 0x%04" PRIx32, param->ctx.recv_op);
@@ -698,14 +855,14 @@ static void example_ble_mesh_sensor_server_cb(esp_ble_mesh_sensor_server_cb_even
         {
         case ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_SET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_SET");
-            example_ble_mesh_send_sensor_cadence_status(param);
+            ble_mesh_send_sensor_cadence_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_SET_UNACK:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_SET_UNACK");
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_SETTING_SET:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_SETTING_SET");
-            example_ble_mesh_send_sensor_setting_status(param);
+            ble_mesh_send_sensor_setting_status(param);
             break;
         case ESP_BLE_MESH_MODEL_OP_SENSOR_SETTING_SET_UNACK:
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_SENSOR_SETTING_SET_UNACK");
@@ -720,7 +877,17 @@ static void example_ble_mesh_sensor_server_cb(esp_ble_mesh_sensor_server_cb_even
         break;
     }
 }
-static void example_ble_mesh_sensor_timeout(uint32_t opcode)
+
+/**
+ * @brief Sensor Timeout Handler
+ *
+ * Handles timeout events for sensor GET/SET messages.
+ *
+ * Why this callback is necessary:
+ * Allows the application to log and react to messages that did not receive a response
+ * from a peer sensor server in time.
+ */
+static void ble_mesh_sensor_timeout(uint32_t opcode)
 {
     switch (opcode)
     {
@@ -759,8 +926,20 @@ static void example_ble_mesh_sensor_timeout(uint32_t opcode)
     // example_ble_mesh_send_sensor_message(opcode);
 }
 
-static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t event,
-                                              esp_ble_mesh_sensor_client_cb_param_t *param)
+/**
+ * @brief Sensor Client callback
+ *
+ * Handles sensor client events:
+ * - Receiving GET/SET responses
+ * - Processing published sensor data
+ * - Handling timeouts
+ *
+ * Why this callback is necessary:
+ * Sensor clients need to handle incoming data from servers, parse property IDs,
+ * map data to MAC addresses, and optionally publish to a cloud gateway.
+ */
+static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t event,
+                                      esp_ble_mesh_sensor_client_cb_param_t *param)
 {
     esp_ble_mesh_node_t *node = NULL;
 
@@ -854,7 +1033,7 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
                         uint8_t *value_data = chunk + mpid_len;
                         ESP_LOG_BUFFER_HEX("Sensor Data", value_data, data_len);
 
-                        if (prop_id == SENSOR_PROPERTY_ID_0 || prop_id == SENSOR_PROPERTY_ID_1)
+                        if (prop_id == TEMP_PROPERTY_ID_0 || prop_id == HUM_PROPERTY_ID_1)
                         {
                             int8_t raw_val = value_data[0]; // temp or humidity
                             uint8_t mac[6];
@@ -864,13 +1043,13 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
                                 ESP_LOGI(TAG, "Found MAC for 0x%04X: %02X:%02X:%02X:%02X:%02X:%02X",
                                          unicast_addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-                                if (prop_id == SENSOR_PROPERTY_ID_0)
+                                if (prop_id == TEMP_PROPERTY_ID_0)
                                     ESP_LOGI(TAG, "Temperature value from 0x%04X: %d°C", unicast_addr, raw_val);
                                 else
                                     ESP_LOGI(TAG, "Humidity value from 0x%04X: %d%%", unicast_addr, raw_val);
 
                                 char json_params[256];
-                                if (prop_id == SENSOR_PROPERTY_ID_0)
+                                if (prop_id == HUM_PROPERTY_ID_1)
                                     snprintf(json_params, sizeof(json_params),
                                              "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
                                              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
@@ -964,7 +1143,7 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
                 {
                     uint8_t *value_data = data + mpid_len;
                     ESP_LOG_BUFFER_HEX("Sensor Data", data + mpid_len, data_len + 1);
-                    if (prop_id == SENSOR_PROPERTY_ID_2)
+                    if (prop_id == MAC_PROPERTY_ID_2)
                     {
                         uint8_t mac[6] = {0};
                         if (data_len >= 6)
@@ -1003,14 +1182,26 @@ static void example_ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_even
 
     break;
     case ESP_BLE_MESH_SENSOR_CLIENT_TIMEOUT_EVT:
-        example_ble_mesh_sensor_timeout(param->params->opcode);
+        ble_mesh_sensor_timeout(param->params->opcode);
     default:
         break;
     }
 }
 
-void example_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
-                             esp_ble_mesh_model_cb_param_t *param)
+/**
+ * @brief Custom/Vendor Model callback
+ *
+ * Handles events for custom/vendor BLE Mesh models:
+ * - ESP_BLE_MESH_MODEL_OPERATION_EVT: Incoming vendor-specific message
+ * - ESP_BLE_MESH_CLIENT_MODEL_RECV_PUBLISH_MSG_EVT: Late/unsolicited response
+ * - ESP_BLE_MESH_CLIENT_MODEL_SEND_TIMEOUT_EVT: Timeout waiting for server
+ * - ESP_BLE_MESH_MODEL_PUBLISH_UPDATE_EVT: Periodic publish update
+ *
+ * Why this callback is necessary:
+ * Custom/vendor models do not have standard behavior defined, so this function allows
+ * the application to receive, log, and act on custom messages or timeouts.
+ */
+static void custom_model_cb(esp_ble_mesh_model_cb_event_t event, esp_ble_mesh_model_cb_param_t *param)
 {
     switch (event)
     {
@@ -1051,6 +1242,7 @@ void example_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
     }
 }
 
+// Initialize BLE Mesh and related callbacks
 static esp_err_t ble_mesh_init(void)
 {
     esp_err_t err;
@@ -1058,11 +1250,11 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_gatts_register_callback(gatts_event_handler);
     esp_ble_gap_register_callback(gap_event_handler);
     esp_ble_gatts_app_register(ESP_APP_ID);
-    esp_ble_mesh_register_prov_callback(example_ble_mesh_provisioning_cb);
-    esp_ble_mesh_register_config_server_callback(example_ble_mesh_config_server_cb);
-    esp_ble_mesh_register_sensor_server_callback(example_ble_mesh_sensor_server_cb);
-    esp_ble_mesh_register_sensor_client_callback(example_ble_mesh_sensor_client_cb);
-    esp_ble_mesh_register_custom_model_callback(example_custom_model_cb);
+    esp_ble_mesh_register_prov_callback(ble_mesh_provisioning_cb);
+    esp_ble_mesh_register_config_server_callback(ble_mesh_config_server_cb);
+    esp_ble_mesh_register_sensor_server_callback(ble_mesh_sensor_server_cb);
+    esp_ble_mesh_register_sensor_client_callback(ble_mesh_sensor_client_cb);
+    esp_ble_mesh_register_custom_model_callback(custom_model_cb);
 
     err = esp_ble_mesh_init(&provision, &composition);
     if (err != ESP_OK)
@@ -1085,6 +1277,7 @@ static esp_err_t ble_mesh_init(void)
     return ESP_OK;
 }
 
+// Task to fetch the ESP32 BLE MAC and store it in a sensor state for publishing
 static void store_mac_in_sensor(void *arg)
 {
     while (1)
@@ -1099,10 +1292,10 @@ static void store_mac_in_sensor(void *arg)
         {
             ESP_LOGE(TAG, "Failed to get Bluetooth MAC");
         }
-        net_buf_simple_reset(&sensor_data_2);
+        net_buf_simple_reset(&mac_address_data_2);
 
         // Store the 6-byte MAC
-        net_buf_simple_add_mem(&sensor_data_2, mac, 6);
+        net_buf_simple_add_mem(&mac_address_data_2, mac, 6);
 
         // Update sensor state length
         sensor_states[2].sensor_data.length = 6;
@@ -1113,7 +1306,7 @@ static void store_mac_in_sensor(void *arg)
         // Prepare payload to publish
         uint8_t status[10]; // buffer for sending sensor data
         uint16_t len = 0;
-        len += example_ble_mesh_get_sensor_data(&sensor_states[2], status + len);
+        len += ble_mesh_get_sensor_data(&sensor_states[2], status + len);
 
         esp_err_t err = esp_ble_mesh_model_publish(sensor_pub.model,
                                                    ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS,
@@ -1126,29 +1319,31 @@ static void store_mac_in_sensor(void *arg)
     } // Update every 60 seconds
 }
 
-static void example_ble_mesh_set_msg_common(esp_ble_mesh_client_common_param_t *common,
-                                            uint16_t unicast_addr,
-                                            esp_ble_mesh_model_t *model,
-                                            uint32_t opcode)
+// Helper function to setup common BLE Mesh client parameters
+static void ble_mesh_set_msg_common(esp_ble_mesh_client_common_param_t *common,
+                                    uint16_t unicast_addr,
+                                    esp_ble_mesh_model_t *model,
+                                    uint32_t opcode)
 {
-    common->opcode = opcode;
-    common->model = model;
-    common->ctx.net_idx = 0;
-    common->ctx.app_idx = 0;
-    common->ctx.addr = unicast_addr;
-    common->ctx.send_ttl = 3;
-    common->msg_timeout = 0;
-    common->msg_role = ROLE_NODE;
+    common->opcode = opcode;         // Message operation code
+    common->model = model;           // Associated BLE Mesh model
+    common->ctx.net_idx = 0;         // Network index
+    common->ctx.app_idx = 0;         // Application index
+    common->ctx.addr = unicast_addr; // Target node unicast address
+    common->ctx.send_ttl = 3;        // TTL for message
+    common->msg_timeout = 0;         // Timeout
+    common->msg_role = ROLE_NODE;    // Node role
 }
 
-void example_ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode, uint16_t property_id)
+// Send a SENSOR_GET message to a specific node for a given property
+void ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode, uint16_t property_id)
 {
     esp_ble_mesh_sensor_client_get_state_t get = {0};
     esp_ble_mesh_client_common_param_t common = {0};
     esp_err_t err;
 
     // Prepare message common parameters
-    example_ble_mesh_set_msg_common(&common, unicast_addr, sensor_client.model, opcode);
+    ble_mesh_set_msg_common(&common, unicast_addr, sensor_client.model, opcode);
 
     // Prepare GET request for specific property ID
     get.sensor_get.property_id = property_id;
@@ -1166,11 +1361,12 @@ void example_ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode
     }
 }
 
+// Periodic task to request sensor data from all nodes
 static void sensor_update_task(void *arg)
 {
     uint16_t property_ids[] = {
-        SENSOR_PROPERTY_ID_0,
-        SENSOR_PROPERTY_ID_1};
+        TEMP_PROPERTY_ID_0,
+        HUM_PROPERTY_ID_1};
     size_t property_count = sizeof(property_ids) / sizeof(property_ids[0]);
 
     while (1)
@@ -1188,7 +1384,7 @@ static void sensor_update_task(void *arg)
 
                 for (size_t j = 0; j < property_count; j++)
                 {
-                    example_ble_mesh_send_sensor_message(
+                    ble_mesh_send_sensor_message(
                         unicast_addr,
                         ESP_BLE_MESH_MODEL_OP_SENSOR_GET,
                         property_ids[j]);
@@ -1199,15 +1395,18 @@ static void sensor_update_task(void *arg)
         }
 
         // Wait 5 minutes before next round
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
-void sensorserver_main(void)
+// Main function for BLE Mesh
+void ble_mesh_main(void)
 {
     esp_err_t err;
+    // Initialize board peripherals
     board_init();
 
+    // Initialize Bluetooth
     err = bluetooth_init();
     if (err)
     {
@@ -1219,9 +1418,10 @@ void sensorserver_main(void)
     if (strcmp(mesh_type, "mesh_node") == 0 || strcmp(mesh_type, "mesh_gateway") == 0)
     {
 
+        // Generate device UUID
         ble_mesh_get_dev_uuid(dev_uuid);
 
-        /* Initialize the Bluetooth Mesh Subsystem */
+        // Initialize BLE Mesh
         err = ble_mesh_init();
         if (err)
         {
@@ -1239,5 +1439,6 @@ void sensorserver_main(void)
 
         bt_mesh_set_device_name(mesh_name);
     }
+    // Initialize Wi-Fi station
     wifi_init_sta();
 }

@@ -34,7 +34,9 @@
     "esp_err.h": "c",
     "compare": "c",
     "mesh_handler.h": "c",
-    "proxy_server.h": "c"
+    "proxy_server.h": "c",
+    "cjson.h": "c",
+    "wifi_manager.h": "c"
   },
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"

@@ -31,17 +31,24 @@
 #include "wifi_manager.h"
 #include "custom_characteristic.h"
 
+// Bit flags for configuring advertisement and scan response data
 #define ADV_CONFIG_FLAG (1 << 0)
 #define SCAN_RSP_CONFIG_FLAG (1 << 1)
 
+// Keeps track of advertisement configuration completion
 static uint8_t adv_config_done = 0;
 
-uint16_t heart_rate_handle_table[HRS_IDX_NB];
+uint16_t attribute_handle_table[HRS_IDX_NB];
 
+
+/* Environment structure for prepared write operations */
 static prepare_type_env_t prepare_write_env;
 
+
+// Define this to use raw advertisement data instead of structured config
 #define CONFIG_SET_RAW_ADV_DATA
 #ifdef CONFIG_SET_RAW_ADV_DATA
+// Raw advertisement packet (max 31 bytes)
 static uint8_t raw_adv_data[] = {
     /* flags */
     0x02, 0x01, 0x06,
@@ -81,15 +88,20 @@ static uint8_t service_uuid[16] = {
     0x00,
 };
 
+
+/* ------------------------------- */
+/*     Advertisement Configuration */
+/* ------------------------------- */
+
 /* The length of adv data must be less than 31 bytes */
 static esp_ble_adv_data_t adv_data = {
-    .set_scan_rsp = false,
-    .include_name = true,
-    .include_txpower = true,
-    .min_interval = 0x0006, // slave connection min interval, Time = min_interval * 1.25 msec
-    .max_interval = 0x0010, // slave connection max interval, Time = max_interval * 1.25 msec
-    .appearance = 0x00,
-    .manufacturer_len = 0,       // TEST_MANUFACTURER_DATA_LEN,
+    .set_scan_rsp = false,             // Not a scan response
+    .include_name = true,              // Include device name
+    .include_txpower = true,           // Include TX power level
+    .min_interval = 0x0006,            // Minimum connection interval (7.5ms)
+    .max_interval = 0x0010,            // Maximum connection interval (20ms)
+    .appearance = 0x00,                // No appearance set
+    .manufacturer_len = 0,             // No manufacturer data
     .p_manufacturer_data = NULL, // test_manufacturer,
     .service_data_len = 0,
     .p_service_data = NULL,
@@ -98,7 +110,10 @@ static esp_ble_adv_data_t adv_data = {
     .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
 };
 
-// scan response data
+/* ------------------------------- */
+/*     Scan Response Configuration */
+/* ------------------------------- */
+
 static esp_ble_adv_data_t scan_rsp_data = {
     .set_scan_rsp = true,
     .include_name = true,
@@ -116,6 +131,9 @@ static esp_ble_adv_data_t scan_rsp_data = {
 };
 #endif /* CONFIG_SET_RAW_ADV_DATA */
 
+/* ------------------------------- */
+/*   Advertisement Parameters      */
+/* ------------------------------- */
 static esp_ble_adv_params_t adv_params = {
     .adv_int_min = 0x20,
     .adv_int_max = 0x40,
@@ -125,43 +143,65 @@ static esp_ble_adv_params_t adv_params = {
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+/* ------------------------------- */
+/*       GATT Profile Struct       */
+/* ------------------------------- */
+
+// Structure holding a single GATT profile instance
 struct gatts_profile_inst
 {
-    esp_gatts_cb_t gatts_cb;
-    uint16_t gatts_if;
-    uint16_t app_id;
-    uint16_t conn_id;
-    uint16_t service_handle;
-    esp_gatt_srvc_id_t service_id;
-    uint16_t char_handle;
-    esp_bt_uuid_t char_uuid;
-    esp_gatt_perm_t perm;
-    esp_gatt_char_prop_t property;
-    uint16_t descr_handle;
-    esp_bt_uuid_t descr_uuid;
+    esp_gatts_cb_t gatts_cb;                 // Callback function for GATT events
+    uint16_t gatts_if;                       // GATT interface (assigned at registration)
+    uint16_t app_id;                         // Application ID
+    uint16_t conn_id;                        // Connection ID
+    uint16_t service_handle;                 // Handle for the created service
+    esp_gatt_srvc_id_t service_id;           // Service ID structure
+    uint16_t char_handle;                    // Characteristic handle
+    esp_bt_uuid_t char_uuid;                 // Characteristic UUID
+    esp_gatt_perm_t perm;                    // Characteristic permissions
+    esp_gatt_char_prop_t property;           // Characteristic properties
+    uint16_t descr_handle;                   // Descriptor handle
+    esp_bt_uuid_t descr_uuid;                // Descriptor UUID
 };
 
+/* ------------------------------- */
+/*  GATT Profile Instance Table    */
+/* ------------------------------- */
+
 /* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
-static struct gatts_profile_inst heart_rate_profile_tab[PROFILE_NUM] = {
+static struct gatts_profile_inst attribute_profile_tab[PROFILE_NUM] = {
     [PROFILE_APP_IDX] = {
         .gatts_cb = gatts_profile_event_handler,
         .gatts_if = ESP_GATT_IF_NONE, /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
     },
 };
 
-/* Service */
-static const uint16_t GATTS_SERVICE_UUID_TEST = 0x00FF;
-static const uint16_t GATTS_CHAR_UUID_TEST_A = 0xFF01;
-static const uint16_t GATTS_CHAR_UUID_TEST_B = 0xFF02;
-static const uint16_t GATTS_CHAR_UUID_TEST_C = 0xFF03;
+/* ------------------------------------------------------------
+ * Custom GATT Service and Characteristic Definitions
+ * ------------------------------------------------------------ */
 
+/* Custom Service UUID (Primary Service) */
+static const uint16_t SENSOR_SERVICE_UUID = 0x00FF;
+
+/* Characteristic UUIDs for the custom service */
+ static const uint16_t SENSOR_CHAR_UUID_DATA   = 0xFF01; // Characteristic for sensor data exchange
+ static const uint16_t SENSOR_CHAR_UUID_CONFIG = 0xFF02; // SENSOR_CHAR_UUID_STATUS is used to read/write Wi-Fi list
+ static const uint16_t SENSOR_CHAR_UUID_STATUS = 0xFF03; // Characteristic for device status or response
+
+/* Standard GATT UUIDs (used by BLE framework) */
 static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
 static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
-static const uint8_t char_prop_read = ESP_GATT_CHAR_PROP_BIT_READ;
+
+/* Characteristic properties */
+ static const uint8_t char_prop_read = ESP_GATT_CHAR_PROP_BIT_READ;
 static const uint8_t char_prop_write = ESP_GATT_CHAR_PROP_BIT_WRITE;
 static const uint8_t char_prop_read_write_notify = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
-static const uint8_t heart_measurement_ccc[2] = {0x00, 0x00};
+
+/* Default Client Characteristic Configuration (notifications disabled by default) */
+static const uint8_t sensor_measurement_ccc[2] = {0x00, 0x00};
+
+/* Default characteristic value (placeholder/test data) */
 static const uint8_t char_value[4] = {0x11, 0x22, 0x33, 0x44};
 
 /* Full Database Description - Used to add attributes into the database */
@@ -169,7 +209,7 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
     {
         // Service Declaration
         [IDX_SVC] =
-            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid, ESP_GATT_PERM_READ, sizeof(uint16_t), sizeof(GATTS_SERVICE_UUID_TEST), (uint8_t *)&GATTS_SERVICE_UUID_TEST}},
+            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid, ESP_GATT_PERM_READ, sizeof(uint16_t), sizeof(SENSOR_SERVICE_UUID), (uint8_t *)&SENSOR_SERVICE_UUID}},
 
         /* Characteristic Declaration */
         [IDX_CHAR_A] =
@@ -177,11 +217,11 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 
         /* Characteristic Value */
         [IDX_CHAR_VAL_A] =
-            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_A, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&SENSOR_CHAR_UUID_DATA, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
         /* Client Characteristic Configuration Descriptor */
         [IDX_CHAR_CFG_A] =
-            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t), sizeof(heart_measurement_ccc), (uint8_t *)heart_measurement_ccc}},
+            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&character_client_config_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(uint16_t), sizeof(sensor_measurement_ccc), (uint8_t *)sensor_measurement_ccc}},
 
         /* Characteristic Declaration */
         [IDX_CHAR_B] =
@@ -189,7 +229,7 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 
         /* Characteristic Value */
         [IDX_CHAR_VAL_B] =
-            {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_B, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, 0, NULL}},
+            {{ESP_GATT_RSP_BY_APP}, {ESP_UUID_LEN_16, (uint8_t *)&SENSOR_CHAR_UUID_CONFIG, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, 0, NULL}},
 
         /* Characteristic Declaration */
         [IDX_CHAR_C] =
@@ -197,10 +237,18 @@ static const esp_gatts_attr_db_t gatt_db[HRS_IDX_NB] =
 
         /* Characteristic Value */
         [IDX_CHAR_VAL_C] =
-            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_UUID_TEST_C, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
+            {{ESP_GATT_AUTO_RSP}, {ESP_UUID_LEN_16, (uint8_t *)&SENSOR_CHAR_UUID_STATUS, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, GATTS_DEMO_CHAR_VAL_LEN_MAX, sizeof(char_value), (uint8_t *)char_value}},
 
 };
 
+/**
+ * @brief GAP Event Handler
+ *
+ * This function handles Bluetooth Low Energy (BLE) GAP events such as
+ * advertisement configuration, start/stop events, and connection parameter updates.
+ *
+ * GAP (Generic Access Profile) defines how BLE devices advertise, scan, and connect.
+ */
 void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
     switch (event)
@@ -271,7 +319,18 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
     }
 }
 
-void example_prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
+/**
+ * @brief Handles the GATT prepare write event.
+ *
+ * This function is triggered when a client performs a "prepare write" operation.
+ * It temporarily stores the data being written in a buffer until the "execute write"
+ * event is received, at which point the entire value can be processed.
+ *
+ * @param gatts_if             GATT server interface ID.
+ * @param prepare_write_env    Pointer to the structure used for buffering prepared writes.
+ * @param param                Pointer to GATT server callback parameters.
+ */
+void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
 {
     ESP_LOGI(GATTS_TABLE_TAG, "prepare write, handle = %d, value len = %d", param->write.handle, param->write.len);
     esp_gatt_status_t status = ESP_GATT_OK;
@@ -329,6 +388,31 @@ void example_prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t 
     prepare_write_env->prepare_len += param->write.len;
 }
 
+
+/**
+ * @brief Handle and process configuration JSON received from an external source.
+ *
+ * This function parses the input JSON string, extracts Wi-Fi and mesh configuration
+ * parameters, saves them into NVS, and restarts the device to apply the new settings.
+ *
+ * Expected JSON structure:
+ * {
+ *   "config": {
+ *       "ssid": "WiFi_Name",
+ *       "password": "WiFi_Pass",
+ *       "type": 1,             // 1 = Mesh, 2 = Standalone
+ *       "isgateway": true      // true = Gateway, false = Node
+ *   }
+ * }
+ *
+ * Behavior:
+ *  - If `type == 1` and `isgateway == true`: configure as mesh gateway.
+ *  - If `type == 1` and `isgateway == false`: configure as mesh node.
+ *  - If `type != 1`: configure as standalone Wi-Fi device.
+ *
+ * @param json_str Pointer to a dynamically allocated JSON string. Freed inside this function.
+ */
+
 void handle_config_json(char *json_str)
 {
     if (!json_str)
@@ -358,7 +442,8 @@ void handle_config_json(char *json_str)
         { // Mesh type
             if (is_gateway)
             {
-                // Gateway mesh: SSID/password + network info
+                // ---- Mesh Gateway ----
+                // Requires valid SSID and password
                 if (!ssid_item || !pass_item || !cJSON_IsString(ssid_item) || !cJSON_IsString(pass_item))
                 {
                     ESP_LOGE(TAG, "Missing SSID or password for gateway mesh");
@@ -367,13 +452,16 @@ void handle_config_json(char *json_str)
                 {
                     const char *ssid = ssid_item->valuestring;
                     const char *password = pass_item->valuestring;
+
+                    // Save credentials and set mode to mesh gateway
                     nvs_save_wifi_credentials((char *)ssid, (char *)password);
                     nvs_save_string_value("mesh_type", "mesh_gateway");
                 }
             }
             else
             {
-                // Non-gateway mesh: no SSID/password
+                // ---- Mesh Node ----
+                // Does not require SSID or password
                 nvs_delete_key("ssid");
                 nvs_delete_key("password");
                 nvs_save_string_value("mesh_type", "mesh_node");
@@ -389,11 +477,14 @@ void handle_config_json(char *json_str)
             {
                 const char *ssid = ssid_item->valuestring;
                 const char *password = pass_item->valuestring;
+
+                // Save standalone Wi-Fi credentials
+
                 nvs_save_wifi_credentials((char *)ssid, (char *)password);
                 nvs_save_string_value("mesh_type", "mesh_standalone");
             }
         }
-
+        // Restart device to apply new configuration
         ESP_LOGI(TAG, "Restarting ESP32 to apply new Wi-Fi settings...");
         vTaskDelay(pdMS_TO_TICKS(2000));
 
@@ -402,8 +493,24 @@ void handle_config_json(char *json_str)
     cJSON_Delete(root);
     free(json_str);
 }
+/**
+ * @brief Handle the execution of a prepared GATT write event.
+ *
+ * This function is called when the client sends an "Execute Write" request
+ * (after one or more "Prepare Write" requests). It processes the accumulated
+ * data in the buffer, interprets it as JSON, and triggers configuration logic.
+ *
+ * Workflow:
+ * 1. Check if the write flag indicates "execute".
+ * 2. If so, combine all previously written chunks into a single JSON string.
+ * 3. Pass the JSON data to `handle_config_json()` for parsing and applying configuration.
+ * 4. Clean up allocated memory and reset the environment buffer.
+ *
+ * @param prepare_write_env Pointer to structure holding prepared write buffer and length.
+ * @param param BLE GATT callback parameter containing write execution details.
+ */
 
-void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
+void exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param)
 {
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC && prepare_write_env->prepare_buf)
     {
@@ -438,6 +545,19 @@ void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble
     prepare_write_env->prepare_len = 0;
 }
 
+/**
+ * @brief Profile-specific GATT event handler.
+ *
+ * Handles all primary GATT Server events for a single profile instance, including:
+ * - Service and characteristic registration
+ * - Advertising configuration
+ * - Read and write requests
+ * - MTU updates, connection management, and attribute table setup
+ *
+ * @param event      GATT server callback event type
+ * @param gatts_if   GATT interface handle
+ * @param param      GATT callback parameters
+ */
 void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
     switch (event)
@@ -493,7 +613,7 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
         memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
         rsp.attr_value.handle = param->read.handle;
 
-        if (param->read.handle == heart_rate_handle_table[IDX_CHAR_VAL_B])
+        if (param->read.handle == attribute_handle_table[IDX_CHAR_VAL_B])
         {
             uint16_t remaining = wifi_total_len - wifi_read_index;
 
@@ -556,7 +676,7 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
         {
             // the data length of gattc write  must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
             ESP_LOGI(GATTS_TABLE_TAG, "GATT_WRITE_EVT, handle = %d, value len = %d, value :", param->write.handle, param->write.len);
-            if (heart_rate_handle_table[IDX_CHAR_CFG_A] == param->write.handle && param->write.len == 2)
+            if (attribute_handle_table[IDX_CHAR_CFG_A] == param->write.handle && param->write.len == 2)
             {
                 uint16_t descr_value = param->write.value[1] << 8 | param->write.value[0];
                 if (descr_value == 0x0001)
@@ -568,7 +688,7 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
                         notify_data[i] = i % 0xff;
                     }
                     // the size of notify_data[] need less than MTU size
-                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
+                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, attribute_handle_table[IDX_CHAR_VAL_A],
                                                 sizeof(notify_data), notify_data, false);
                 }
                 else if (descr_value == 0x0002)
@@ -580,7 +700,7 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
                         indicate_data[i] = i % 0xff;
                     }
                     // the size of indicate_data[] need less than MTU size
-                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, heart_rate_handle_table[IDX_CHAR_VAL_A],
+                    esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, attribute_handle_table[IDX_CHAR_VAL_A],
                                                 sizeof(indicate_data), indicate_data, true);
                 }
                 else if (descr_value == 0x0000)
@@ -602,13 +722,13 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
         else
         {
             /* handle prepare write */
-            example_prepare_write_event_env(gatts_if, &prepare_write_env, param);
+            prepare_write_event_env(gatts_if, &prepare_write_env, param);
         }
         break;
     case ESP_GATTS_EXEC_WRITE_EVT:
         // the length of gattc prepare write data must be less than GATTS_DEMO_CHAR_VAL_LEN_MAX.
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_EXEC_WRITE_EVT");
-        example_exec_write_event_env(&prepare_write_env, param);
+        exec_write_event_env(&prepare_write_env, param);
         break;
     case ESP_GATTS_MTU_EVT:
         ESP_LOGI(GATTS_TABLE_TAG, "ESP_GATTS_MTU_EVT, MTU %d", param->mtu.mtu);
@@ -651,8 +771,8 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
         else
         {
             ESP_LOGI(GATTS_TABLE_TAG, "create attribute table successfully, the number handle = %d\n", param->add_attr_tab.num_handle);
-            memcpy(heart_rate_handle_table, param->add_attr_tab.handles, sizeof(heart_rate_handle_table));
-            esp_ble_gatts_start_service(heart_rate_handle_table[IDX_SVC]);
+            memcpy(attribute_handle_table, param->add_attr_tab.handles, sizeof(attribute_handle_table));
+            esp_ble_gatts_start_service(attribute_handle_table[IDX_SVC]);
         }
         break;
     }
@@ -669,6 +789,17 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
     }
 }
 
+/**
+ * @brief Global GATT server event dispatcher.
+ *
+ * Distributes BLE GATT events to each registered profile’s callback.
+ * When a profile is registered, its `gatts_if` handle is stored and used
+ * for filtering incoming events.
+ *
+ * @param event    GATT event type
+ * @param gatts_if GATT interface handle
+ * @param param    GATT event parameters
+ */
 void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
 
@@ -677,7 +808,7 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
     {
         if (param->reg.status == ESP_GATT_OK)
         {
-            heart_rate_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
+            attribute_profile_tab[PROFILE_APP_IDX].gatts_if = gatts_if;
         }
         else
         {
@@ -693,11 +824,11 @@ void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp
         for (idx = 0; idx < PROFILE_NUM; idx++)
         {
             /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
-            if (gatts_if == ESP_GATT_IF_NONE || gatts_if == heart_rate_profile_tab[idx].gatts_if)
+            if (gatts_if == ESP_GATT_IF_NONE || gatts_if == attribute_profile_tab[idx].gatts_if)
             {
-                if (heart_rate_profile_tab[idx].gatts_cb)
+                if (attribute_profile_tab[idx].gatts_cb)
                 {
-                    heart_rate_profile_tab[idx].gatts_cb(event, gatts_if, param);
+                    attribute_profile_tab[idx].gatts_cb(event, gatts_if, param);
                 }
             }
         }
