@@ -401,7 +401,8 @@ void prepare_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare
  *       "ssid": "WiFi_Name",
  *       "password": "WiFi_Pass",
  *       "type": 1,             // 1 = Mesh, 2 = Standalone
- *       "isgateway": true      // true = Gateway, false = Node
+ *       "isgateway": true,      // true = Gateway, false = Node
+ *       "deviceAccessToken": "mqtt_token"  // MQTT device access token (optional)
  *   }
  * }
  *
@@ -434,7 +435,21 @@ void handle_config_json(char *json_str)
         cJSON *pass_item = cJSON_GetObjectItem(config, "password");
         cJSON *type_item = cJSON_GetObjectItem(config, "type");
         cJSON *gw_item = cJSON_GetObjectItem(config, "isgateway");
-   
+        cJSON *token_item = cJSON_GetObjectItem(config, "deviceAccessToken");
+
+        /* Save device access token for MQTT if present */
+        if (token_item && cJSON_IsString(token_item) && token_item->valuestring && token_item->valuestring[0] != '\0')
+        {
+            char token_buf[129];
+            size_t token_len = strlen(token_item->valuestring);
+            if (token_len >= sizeof(token_buf))
+                token_len = sizeof(token_buf) - 1;
+            memcpy(token_buf, token_item->valuestring, token_len);
+            token_buf[token_len] = '\0';
+            nvs_save_string_value("mqtt_tok", token_buf); /* NVS key max 14 chars */
+            ESP_LOGI(TAG, "deviceAccessToken saved for MQTT");
+        }
+
         int type = (type_item && cJSON_IsNumber(type_item)) ? type_item->valueint : 2;
         bool is_gateway = (gw_item && cJSON_IsBool(gw_item)) ? cJSON_IsTrue(gw_item) : false;
 
@@ -615,7 +630,10 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
 
         if (param->read.handle == attribute_handle_table[IDX_CHAR_VAL_B])
         {
-            uint16_t remaining = wifi_total_len - wifi_read_index;
+            /* When already connected to WiFi, do not expose WiFi list */
+            uint16_t remaining = 0;
+            if (!wifi_sta_is_connected())
+                remaining = wifi_total_len - wifi_read_index;
 
             if (remaining > 0)
             {

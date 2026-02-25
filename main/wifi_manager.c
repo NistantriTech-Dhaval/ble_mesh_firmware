@@ -67,8 +67,15 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+/** Return true if STA is connected to an AP. */
+bool wifi_sta_is_connected(void)
+{
+    wifi_ap_record_t ap_info;
+    return (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK);
+}
+
 // Build a comma-separated Wi-Fi SSID list in wifi_buffer
-void build_wifi_list()
+void build_wifi_list(void)
 {
     int offset = 1;  // Start from 1 to leave space for length byte
 
@@ -123,6 +130,11 @@ void wifi_scan_task(void *pvParameter)
     };
 
     while (1) {
+        // Do not scan or update WiFi list when already connected
+        if (wifi_sta_is_connected()) {
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
         // Start Wi-Fi scan (blocking)
         esp_err_t err = esp_wifi_scan_start(&scan_config, true);
         if (err != ESP_OK) {

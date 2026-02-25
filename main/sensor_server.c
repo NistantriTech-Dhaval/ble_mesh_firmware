@@ -214,6 +214,9 @@ static esp_ble_mesh_comp_t composition = {
 
 /* ================= Provisioning Information ================= */
 
+/* Our primary unicast address (set at prov_complete). Gateway/provisioner often uses 0x0001. */
+static uint16_t s_primary_unicast_addr = 0;
+
 /* Provisioning settings
  * - uuid: Unique device UUID used for identification during provisioning
  */
@@ -258,6 +261,7 @@ struct custom_sensor_setting
  */
 static void prov_complete(uint16_t net_idx, uint16_t addr, uint8_t flags, uint32_t iv_index)
 {
+    s_primary_unicast_addr = addr; /* remember our address for own vs other device topic choice */
     ESP_LOGI(TAG, "net_idx 0x%03x, addr 0x%04x", net_idx, addr);
     ESP_LOGI(TAG, "flags 0x%02x, iv_index 0x%08" PRIx32, flags, iv_index);
     // Turn off the green LED to indicate provisioning has completed
@@ -1048,19 +1052,39 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
                                 else
                                     ESP_LOGI(TAG, "Humidity value from 0x%04X: %d%%", unicast_addr, raw_val);
 
-                                char json_params[256];
-                                if (prop_id == HUM_PROPERTY_ID_1)
-                                    snprintf(json_params, sizeof(json_params),
-                                             "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
-                                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                                             raw_val);
-                                else
-                                    snprintf(json_params, sizeof(json_params),
-                                             "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"humidity\":%d}]}",
-                                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                                             raw_val);
+                                /* Own device → v1/devices/me/telemetry; other device → v1/gateway/telemetry (gateway only). */
+                                uint16_t our_addr = s_primary_unicast_addr;
+                                char mesh_type[20];
+                                nvs_get_string_value("mesh_type", mesh_type);
+                                if (our_addr == 0 && strcmp(mesh_type, "mesh_gateway") == 0)
+                                    our_addr = 0x0001; /* provisioner typically uses 0x0001 */
 
-                                publish_sensor_data("v1/gateway/telemetry", json_params);
+                                if (unicast_addr == our_addr)
+                                {
+                                    /* This device's own data → device telemetry topic */
+                                    char json_params[128];
+                                    if (prop_id == HUM_PROPERTY_ID_1)
+                                        snprintf(json_params, sizeof(json_params), "{\"humidity\":%d}", raw_val);
+                                    else
+                                        snprintf(json_params, sizeof(json_params), "{\"temp\":%d}", raw_val);
+                                    publish_sensor_data("v1/devices/me/telemetry", json_params);
+                                }
+                                else if (strcmp(mesh_type, "mesh_gateway") == 0)
+                                {
+                                    /* Other device's data → gateway telemetry topic (only when we are gateway) */
+                                    char json_params[256];
+                                    if (prop_id == HUM_PROPERTY_ID_1)
+                                        snprintf(json_params, sizeof(json_params),
+                                                 "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"humidity\":%d}]}",
+                                                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                                 raw_val);
+                                    else
+                                        snprintf(json_params, sizeof(json_params),
+                                                 "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
+                                                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                                 raw_val);
+                                    publish_sensor_data("v1/gateway/telemetry", json_params);
+                                }
                             }
                             else
                             {

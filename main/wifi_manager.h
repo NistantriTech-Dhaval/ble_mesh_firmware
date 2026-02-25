@@ -1,4 +1,5 @@
 #include "esp_wifi.h"
+#include <stdbool.h>
 
 #define MAX_AP_NUM 20
 
@@ -12,4 +13,7 @@ extern char wifi_buffer[1024]; // buffer containing all SSIDs
 
 void wifi_init_sta(void);
 void wifi_scan_task(void *pvParameter);
-void build_wifi_list();
+void build_wifi_list(void);
+
+/** Return true if STA is connected to an AP (do not fetch WiFi list when connected). */
+bool wifi_sta_is_connected(void);

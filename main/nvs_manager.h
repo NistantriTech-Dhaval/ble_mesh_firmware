@@ -1,5 +1,9 @@
 #include "nvs_flash.h"
 #include "nvs.h"
+#include <stdbool.h>
+
+/** Return true if custom MQTT config (mqtt_host, etc.) is stored in NVS. */
+bool nvs_mqtt_config_available(void);
 
 void nvs_save_wifi_credentials(char *ssid, char *password);
 esp_err_t nvs_get_wifi_credentials(char *ssid, char *password);

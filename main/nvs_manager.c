@@ -156,7 +156,7 @@ int nvs_load_blob_value(const char *key, void *data, size_t *len)
 // Save 32-bit unsigned integer to NVS
 int nvs_save_u32_value(const char *key, uint32_t value) {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open("permanent", NVS_READWRITE, &handle);
+    esp_err_t err = nvs_open("permenant", NVS_READWRITE, &handle);
     if (err != ESP_OK) return -1;
 
     err = nvs_set_u32(handle, key, value);
@@ -173,7 +173,7 @@ int nvs_save_u32_value(const char *key, uint32_t value) {
 // Load 32-bit unsigned integer from NVS
 int nvs_load_u32_value(const char *key, uint32_t *value) {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open("permanent", NVS_READONLY, &handle);
+    esp_err_t err = nvs_open("permenant", NVS_READONLY, &handle);
     if (err != ESP_OK) return -1;
 
     err = nvs_get_u32(handle, key, value);
