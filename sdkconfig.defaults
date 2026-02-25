@@ -1,3 +1,6 @@
+# Reduce IRAM usage (avoid iram0_0_seg overflow)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # Override some defaults so BT stack is enabled
 # by default in this example
 CONFIG_BT_ENABLED=y

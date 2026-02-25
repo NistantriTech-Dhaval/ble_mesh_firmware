@@ -3,7 +3,7 @@
   "idf.espIdfPath": "/Users/nistantritech/esp/esp-idf",
   "idf.toolsPath": "/Users/nistantritech/.espressif",
   "idf.pythonInstallPath": "/opt/homebrew/bin/python3",
-  "idf.port": "/dev/tty.usbserial-2",
+  "idf.port": "/dev/tty.usbserial-0001",
   "idf.flashType": "UART",
   "files.associations": {
     "esp_event.h": "c",

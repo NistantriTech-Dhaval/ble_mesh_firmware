@@ -26,6 +26,7 @@
 #include "mqtt_manager.h"
 #include "wifi_manager.h"
 #include "nvs_manager.h"
+#include "esp_system.h"
 #include "cJSON.h"
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_config_model_api.h"
@@ -329,10 +330,16 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
         prov_complete(param->node_prov_complete.net_idx, param->node_prov_complete.addr,
                       param->node_prov_complete.flags, param->node_prov_complete.iv_index);
         break;
-    case ESP_BLE_MESH_NODE_PROV_RESET_EVT:
-        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_RESET_EVT");
-        nvs_save_string_value("node_type", "sensor_server");
+    case ESP_BLE_MESH_NODE_PROV_RESET_EVT: {
+        ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_RESET_EVT — erasing NVS and restarting to allow re-provisioning");
+        nvs_flash_deinit();
+        esp_err_t err = nvs_flash_erase();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "nvs_flash_erase failed: %s", esp_err_to_name(err));
+        }
+        esp_restart();
         break;
+    }
     case ESP_BLE_MESH_NODE_SET_UNPROV_DEV_NAME_COMP_EVT:
         ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_SET_UNPROV_DEV_NAME_COMP_EVT, err_code %d", param->node_set_unprov_dev_name_comp.err_code);
         break;
@@ -1052,14 +1059,11 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
                                 else
                                     ESP_LOGI(TAG, "Humidity value from 0x%04X: %d%%", unicast_addr, raw_val);
 
-                                /* Own device → v1/devices/me/telemetry; other device → v1/gateway/telemetry (gateway only). */
-                                uint16_t our_addr = s_primary_unicast_addr;
-                                char mesh_type[20];
-                                nvs_get_string_value("mesh_type", mesh_type);
-                                if (our_addr == 0 && strcmp(mesh_type, "mesh_gateway") == 0)
-                                    our_addr = 0x0001; /* provisioner typically uses 0x0001 */
+                                /* If node MAC == this device's BLE MAC → own telemetry; else → gateway telemetry */
+                                uint8_t *our_mac = esp_bt_dev_get_address();
+                                int is_own = (our_mac && memcmp(our_mac, mac, 6) == 0);
 
-                                if (unicast_addr == our_addr)
+                                if (is_own)
                                 {
                                     /* This device's own data → device telemetry topic */
                                     char json_params[128];
@@ -1069,21 +1073,26 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
                                         snprintf(json_params, sizeof(json_params), "{\"temp\":%d}", raw_val);
                                     publish_sensor_data("v1/devices/me/telemetry", json_params);
                                 }
-                                else if (strcmp(mesh_type, "mesh_gateway") == 0)
+                                else
                                 {
-                                    /* Other device's data → gateway telemetry topic (only when we are gateway) */
-                                    char json_params[256];
-                                    if (prop_id == HUM_PROPERTY_ID_1)
-                                        snprintf(json_params, sizeof(json_params),
-                                                 "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"humidity\":%d}]}",
-                                                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                                                 raw_val);
-                                    else
-                                        snprintf(json_params, sizeof(json_params),
-                                                 "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
-                                                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                                                 raw_val);
-                                    publish_sensor_data("v1/gateway/telemetry", json_params);
+                                    char mesh_type[20];
+                                    nvs_get_string_value("mesh_type", mesh_type);
+                                    if (strcmp(mesh_type, "mesh_gateway") == 0)
+                                    {
+                                        /* Other device's data → gateway telemetry topic */
+                                        char json_params[256];
+                                        if (prop_id == HUM_PROPERTY_ID_1)
+                                            snprintf(json_params, sizeof(json_params),
+                                                     "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"humidity\":%d}]}",
+                                                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                                     raw_val);
+                                        else
+                                            snprintf(json_params, sizeof(json_params),
+                                                     "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d}]}",
+                                                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                                     raw_val);
+                                        publish_sensor_data("v1/gateway/telemetry", json_params);
+                                    }
                                 }
                             }
                             else

@@ -13,12 +13,16 @@
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
+#include "cJSON.h"
+#include <stdbool.h>
+#include "led_strip.h"
 
 #define TAG "MQTT"
 
 /* ThingsBoard topics: device own data vs gateway (other devices) */
 #define TOPIC_DEVICE_TELEMETRY "v1/devices/me/telemetry"
 #define TOPIC_GATEWAY_TELEMETRY "v1/gateway/telemetry"
+#define TOPIC_RPC_REQUEST      "v1/devices/me/rpc/request/+"
 
 // MQTT client handle
 static esp_mqtt_client_handle_t client = NULL;
@@ -40,6 +44,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT connected");
         s_mqtt_connected = true;
+
+        /* Subscribe to ThingsBoard RPC request topic */
+        int sub_id = esp_mqtt_client_subscribe(client, TOPIC_RPC_REQUEST, 0);
+        if (sub_id >= 0)
+        {
+            ESP_LOGI(TAG, "Subscribed to RPC topic: %s", TOPIC_RPC_REQUEST);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "RPC subscribe failed");
+        }
 
         // Read mesh type from NVS
         char mesh_type[20];
@@ -69,6 +84,61 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         ESP_LOGE(TAG, "MQTT error occurred");
         s_mqtt_connected = false;
         break;
+
+    case MQTT_EVENT_DATA: {
+        int data_len = event->data_len;
+        if (data_len <= 0)
+        {
+            break;
+        }
+
+        /* Copy payload and null-terminate */
+        char *payload = malloc((size_t)data_len + 1);
+        if (!payload)
+        {
+            break;
+        }
+        memcpy(payload, event->data, (size_t)data_len);
+        payload[data_len] = '\0';
+
+        /* Print received RPC: raw payload */
+        ESP_LOGI(TAG, "RPC received payload: %s", payload);
+
+        /* Parse and print method + params; handle led_status RPC */
+        cJSON *root = cJSON_Parse(payload);
+        if (root)
+        {
+            cJSON *method = cJSON_GetObjectItem(root, "method");
+            cJSON *params = cJSON_GetObjectItem(root, "params");
+            if (cJSON_IsString(method))
+            {
+                ESP_LOGI(TAG, "RPC method: %s", method->valuestring);
+            }
+            if (params && cJSON_IsObject(params))
+            {
+                char *params_str = cJSON_PrintUnformatted(params);
+                if (params_str)
+                {
+                    ESP_LOGI(TAG, "RPC params: %s", params_str);
+                    cJSON_free(params_str);
+                }
+
+                /* led_status: on/off only, or set color. If "color" present → set color; else "status" → on/off */
+                if (cJSON_IsString(method) && strcmp(method->valuestring, "led_status") == 0)
+                {
+                    
+                }
+            }
+            cJSON_Delete(root);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "RPC payload not valid JSON");
+        }
+
+        free(payload);
+        break;
+    }
 
     default:
         break;
