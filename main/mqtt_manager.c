@@ -16,6 +16,7 @@
 #include "cJSON.h"
 #include <stdbool.h>
 #include "led_strip.h"
+#include "sensor_server.h"
 
 #define TAG "MQTT"
 
@@ -123,10 +124,30 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     cJSON_free(params_str);
                 }
 
-                /* led_status: on/off only, or set color. If "color" present → set color; else "status" → on/off */
-                if (cJSON_IsString(method) && strcmp(method->valuestring, "led_status") == 0)
+                /* set_bulb: RPC → send Generic OnOff to particular node (unicast). No subscription needed. */
+                if (cJSON_IsString(method) && strcmp(method->valuestring, "set_bulb") == 0)
                 {
-                    
+                    cJSON *state = cJSON_GetObjectItem(params, "state");
+                    cJSON *addr_item = cJSON_GetObjectItem(params, "address");
+                    int on = 0;
+                    if (cJSON_IsString(state))
+                    {
+                        if (strcmp(state->valuestring, "on") == 0)
+                            on = 1;
+                        else if (strcmp(state->valuestring, "off") == 0)
+                            on = 0;
+                    }
+                    /* Target = particular node unicast (params.address). If omitted, this device. */
+                    uint16_t target = cJSON_IsNumber(addr_item) ? (uint16_t)addr_item->valueint : get_primary_unicast();
+                    if (target != 0)
+                    {
+                        ble_mesh_send_bulb_command(target, on);
+                        ESP_LOGI(TAG, "RPC set_bulb: %s to node 0x%04x (unicast)", on ? "ON" : "OFF", target);
+                    }
+                    else
+                    {
+                        ESP_LOGW(TAG, "RPC set_bulb: provide params.address (unicast) or ensure device is provisioned");
+                    }
                 }
             }
             cJSON_Delete(root);

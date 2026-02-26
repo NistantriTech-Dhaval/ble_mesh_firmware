@@ -34,6 +34,8 @@ void led_strip_set(int on)
 {
     if (!s_initialized || !s_strip)
     {
+        ESP_LOGE(TAG, "LED strip not initialized: init=%d strip=%p",
+                 s_initialized, s_strip);
         return;
     }
 

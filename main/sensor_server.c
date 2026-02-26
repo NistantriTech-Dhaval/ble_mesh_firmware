@@ -23,6 +23,8 @@
 #include "custom_characteristic.h"
 #include "ble_mesh_example_init.h"
 #include "board.h"
+#include "config.h"
+#include "led_strip.h"
 #include "mqtt_manager.h"
 #include "wifi_manager.h"
 #include "nvs_manager.h"
@@ -31,6 +33,7 @@
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_sensor_model_api.h"
+#include "esp_ble_mesh_generic_model_api.h"
 #include "esp_ble_mesh_networking_api.h"
 #include "esp_err.h"
 #include "mesh_handler.h"
@@ -159,6 +162,16 @@ static esp_ble_mesh_sensor_setup_srv_t sensor_setup_server = {
     .states = sensor_states,                  // Pointer to sensor states array
 };
 
+/* ================= Generic OnOff Server (standard light bulb) ================= */
+ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_pub, 2 + 1, ROLE_NODE);
+static esp_ble_mesh_gen_onoff_srv_t onoff_server = {
+    .rsp_ctrl.get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
+    .rsp_ctrl.set_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
+};
+
+/* Generic OnOff Client (gateway sends OnOff Set to group/unicast) */
+static esp_ble_mesh_client_t gen_onoff_client;
+
 /* ================= Vendor Model Definition ================= */
 
 /* Vendor model operations (opcodes) */
@@ -188,7 +201,9 @@ static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),                                   // Configuration server model
     ESP_BLE_MESH_MODEL_SENSOR_SRV(&sensor_pub, &sensor_server),                   // Standard sensor server
     ESP_BLE_MESH_MODEL_SENSOR_SETUP_SRV(&sensor_setup_pub, &sensor_setup_server), // Sensor setup server
-    ESP_BLE_MESH_MODEL_SENSOR_CLI(NULL, &sensor_client)                           // Sensor client model
+    ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub, &onoff_server),                  // Standard Generic OnOff (light bulb)
+    ESP_BLE_MESH_MODEL_SENSOR_CLI(NULL, &sensor_client),                          // Sensor client model
+    ESP_BLE_MESH_MODEL_GEN_ONOFF_CLI(NULL, &gen_onoff_client),                     // Generic OnOff client (send to group/unicast)
 };
 
 /* ================= Elements and Composition ================= */
@@ -250,6 +265,10 @@ struct custom_sensor_setting
     uint16_t sensor_setting_prop_id; // Corresponding setting property ID
 } __attribute__((packed));
 
+/* Forward declarations for tasks created in provisioning callback */
+static void store_mac_in_sensor(void *arg);
+static void sensor_update_task(void *arg);
+
 /* ================= Provisioning Complete Callback ================= */
 /* This function is called when a node has been successfully provisioned
  * into the BLE Mesh network.
@@ -305,8 +324,8 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
         }
         else
         {
-            // Start task to request sensor data from other nodes periodically
-            xTaskCreate(sensor_update_task, "sensor_update_task", 2048, NULL, 5, NULL);
+            // Start task to request sensor data from other nodes periodically (stack 4K for mesh client + logging)
+            xTaskCreate(sensor_update_task, "sensor_update_task", 4096, NULL, 5, NULL);
         }
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
@@ -1222,6 +1241,23 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
 }
 
 /**
+ * @brief Generic Server callback (standard Generic OnOff = light bulb)
+ * When Generic OnOff Set is received, drive LED strip.
+ */
+static void ble_mesh_generic_server_cb(esp_ble_mesh_generic_server_cb_event_t event,
+                                       esp_ble_mesh_generic_server_cb_param_t *param)
+{
+    if (event == ESP_BLE_MESH_GENERIC_SERVER_STATE_CHANGE_EVT
+        && (param->ctx.recv_op == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET
+            || param->ctx.recv_op == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK))
+    {
+        uint8_t onoff = param->value.state_change.onoff_set.onoff;
+        led_strip_set(onoff);
+        ESP_LOGI(TAG, "Generic OnOff (bulb) %s", onoff ? "ON" : "OFF");
+    }
+}
+
+/**
  * @brief Custom/Vendor Model callback
  *
  * Handles events for custom/vendor BLE Mesh models:
@@ -1287,6 +1323,7 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_mesh_register_config_server_callback(ble_mesh_config_server_cb);
     esp_ble_mesh_register_sensor_server_callback(ble_mesh_sensor_server_cb);
     esp_ble_mesh_register_sensor_client_callback(ble_mesh_sensor_client_cb);
+    esp_ble_mesh_register_generic_server_callback(ble_mesh_generic_server_cb);
     esp_ble_mesh_register_custom_model_callback(custom_model_cb);
 
     err = esp_ble_mesh_init(&provision, &composition);
@@ -1392,6 +1429,39 @@ void ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode, uint16
     {
         ESP_LOGI(TAG, "Sent SENSOR_GET (property 0x%04x) to node 0x%04x", property_id, unicast_addr);
     }
+}
+
+/* Send bulb on/off over the mesh using standard Generic OnOff Set. Target node(s) receive and drive LED. */
+static uint8_t s_onoff_tid = 0;
+
+void ble_mesh_send_bulb_command(uint16_t addr, int on)
+{
+    if (!gen_onoff_client.model)
+    {
+        ESP_LOGE(TAG, "Generic OnOff client model not ready");
+        return;
+    }
+    esp_ble_mesh_client_common_param_t common = {0};
+    ble_mesh_set_msg_common(&common, addr, gen_onoff_client.model,
+                            ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK);
+    esp_ble_mesh_generic_client_set_state_t set = {0};
+    set.onoff_set.op_en = false;
+    set.onoff_set.onoff = on ? 1 : 0;
+    set.onoff_set.tid = s_onoff_tid++;
+    esp_err_t err = esp_ble_mesh_generic_client_set_state(&common, &set);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to send Generic OnOff %s to 0x%04x", on ? "ON" : "OFF", addr);
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Sent Generic OnOff %s to 0x%04x (mesh)", on ? "ON" : "OFF", addr);
+    }
+}
+
+uint16_t get_primary_unicast(void)
+{
+    return s_primary_unicast_addr;
 }
 
 // Periodic task to request sensor data from all nodes
