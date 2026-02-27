@@ -5,7 +5,7 @@
 #define PROV_DEVOCE_NAME "NTPL_DEVICE"
 
 /* LED strip: WS2811/WS2812 on one GPIO (RMT). Set length to your strip size. */
-#define LED_STRIP_GPIO  5
+#define LED_STRIP_GPIO  GPIO_NUM_13
 #define LED_STRIP_LEN   1
 
 /* BLE Mesh: bulb control is by unicast only (particular node). No group subscription required. */

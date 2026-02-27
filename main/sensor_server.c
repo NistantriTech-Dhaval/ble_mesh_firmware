@@ -163,11 +163,14 @@ static esp_ble_mesh_sensor_setup_srv_t sensor_setup_server = {
 };
 
 /* ================= Generic OnOff Server (standard light bulb) ================= */
+#define ONOFF_GROUP_ADDR 0xC000 /* Same group as sensor: node publishes status, gateway subscribes and uploads to ThingBoard */
 ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_pub, 2 + 1, ROLE_NODE);
 static esp_ble_mesh_gen_onoff_srv_t onoff_server = {
     .rsp_ctrl.get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
     .rsp_ctrl.set_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
 };
+/* Bulb mesh attribute: OnOff state (LED + Status). Gateway: update this and send telemetry. Node: update and publish to group. */
+static uint8_t s_bulb_onoff = 0;
 
 /* Generic OnOff Client (gateway sends OnOff Set to group/unicast) */
 static esp_ble_mesh_client_t gen_onoff_client;
@@ -266,7 +269,7 @@ struct custom_sensor_setting
 } __attribute__((packed));
 
 /* Forward declarations for tasks created in provisioning callback */
-static void store_mac_in_sensor(void *arg);
+static void sensor_group_publish_task(void *arg);
 static void sensor_update_task(void *arg);
 
 /* ================= Provisioning Complete Callback ================= */
@@ -312,20 +315,14 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
         /* Node registration complete event
          * Check node type from NVS ("sensor_server" or other)
-         * - If node, start a task to store MAC address
-         * - If gateway, start periodic sensor update task
+         * - If node (sensor_server): publish sensor data to group every 10s (gateway subscribes and uploads to ThingBoard)
+         * - If gateway: subscribe to group is done by configurator; gateway handles upload in sensor client callback
          */
-        char node_type[20]; // Array to hold the custom color
+        char node_type[20];
         nvs_get_string_value("node_type", node_type);
         if (strcmp(node_type, "sensor_server") == 0)
         {
-            // For sensor server nodes, start a task to store MAC address
-            xTaskCreate(store_mac_in_sensor, "store_mac_in_sensor", 2048, NULL, 5, NULL);
-        }
-        else
-        {
-            // Start task to request sensor data from other nodes periodically (stack 4K for mesh client + logging)
-            xTaskCreate(sensor_update_task, "sensor_update_task", 4096, NULL, 5, NULL);
+            xTaskCreate(sensor_group_publish_task, "sensor_grp_pub", 2048, NULL, 5, NULL);
         }
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
@@ -423,23 +420,29 @@ static void ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t event,
                 }
             }
             break;
-        case ESP_BLE_MESH_MODEL_OP_MODEL_SUB_DELETE:
+        case ESP_BLE_MESH_MODEL_OP_MODEL_SUB_DELETE: {
+            static bool gateway_unsub_1102 = false; /* Sensor Client */
+            static bool gateway_unsub_1001 = false; /* Generic OnOff Client */
+            uint16_t mod_id = param->value.state_change.mod_sub_add.model_id;
             ESP_LOGI(TAG, "ESP_BLE_MESH_MODEL_OP_MODEL_SUB_DELETE");
             ESP_LOGI(TAG, "elem_addr 0x%04x, sub_addr 0x%04x, cid 0x%04x, mod_id 0x%04x",
                      param->value.state_change.mod_sub_add.element_addr,
                      param->value.state_change.mod_sub_add.sub_addr,
                      param->value.state_change.mod_sub_add.company_id,
-                     param->value.state_change.mod_sub_add.model_id);
-            // If the unsubscribed model is 0x1102, erase NVS and restart.
-            // This effectively converts a gateway back into a standard node.
-
-            if (param->value.state_change.mod_sub_add.model_id == 0x1102)
+                     mod_id);
+            if (mod_id == 0x1102)
+                gateway_unsub_1102 = true;
+            else if (mod_id == 0x1001)
+                gateway_unsub_1001 = true;
+            /* Restart only after both gateway models unsubscribed so app can complete second delete */
+            if (gateway_unsub_1102 && gateway_unsub_1001)
             {
-                ESP_LOGI(TAG, "Model 0x1102 unsubscribed — restart esp32...");
+                ESP_LOGI(TAG, "Gateway models 0x1102 and 0x1001 unsubscribed — erase NVS and restart");
                 nvs_erase_all_key();
                 esp_restart();
             }
             break;
+        }
         default:
             break;
         }
@@ -1169,13 +1172,17 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
         break;
     case ESP_BLE_MESH_SENSOR_CLIENT_PUBLISH_EVT:
     {
-        ESP_LOGI(TAG, "ESP_BLE_MESH_SENSOR_CLIENT_PUBLISH_EVT");
+        ESP_LOGI(TAG, "ESP_BLE_MESH_SENSOR_CLIENT_PUBLISH_EVT (group/periodic publish from node)");
 
         if (param->status_cb.sensor_status.marshalled_sensor_data &&
             param->status_cb.sensor_status.marshalled_sensor_data->len > 0)
         {
             uint16_t unicast_addr = param->params->ctx.addr;
-            ESP_LOGI(TAG, "Sensor status received from server unicast address: 0x%04x", unicast_addr);
+            uint8_t mac[6] = {0};
+            bool mac_from_payload = false;
+            int8_t temp_val = -128, hum_val = -128; /* invalid until set */
+
+            ESP_LOGI(TAG, "Sensor status from addr 0x%04x (group publish)", unicast_addr);
 
             uint8_t *data = param->status_cb.sensor_status.marshalled_sensor_data->data;
             int len = param->status_cb.sensor_status.marshalled_sensor_data->len;
@@ -1188,45 +1195,68 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
                 uint16_t prop_id = ESP_BLE_MESH_GET_SENSOR_DATA_PROPERTY_ID(data, fmt);
                 uint8_t mpid_len = (fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? ESP_BLE_MESH_SENSOR_DATA_FORMAT_A_MPID_LEN : ESP_BLE_MESH_SENSOR_DATA_FORMAT_B_MPID_LEN);
 
-                ESP_LOGI(TAG, "Format %s, length 0x%02x, Sensor Property ID 0x%04x",
-                         fmt == ESP_BLE_MESH_SENSOR_DATA_FORMAT_A ? "A" : "B", data_len, prop_id);
-
                 if (data_len != ESP_BLE_MESH_SENSOR_DATA_ZERO_LEN)
                 {
                     uint8_t *value_data = data + mpid_len;
-                    ESP_LOG_BUFFER_HEX("Sensor Data", data + mpid_len, data_len + 1);
-                    if (prop_id == MAC_PROPERTY_ID_2)
+                    /* Length is zero-based: 0 = 1 octet (temp/humidity), 5 = 6 octets (MAC) */
+                    uint8_t value_bytes = data_len + 1;
+                    if (prop_id == MAC_PROPERTY_ID_2 && value_bytes >= 6)
                     {
-                        uint8_t mac[6] = {0};
-                        if (data_len >= 6)
-                        {
-                            memcpy(mac, data + mpid_len, 6);
-                            ESP_LOGI(TAG, "Extracted MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-                            // 🔹 Try to add node — skip if already stored
-                            int result = mesh_handler_add_node(unicast_addr, mac);
-                            if (result == 1)
-                            {
-                                ESP_LOGI(TAG, "New node stored: Unicast=0x%04X", unicast_addr);
-                            }
-                            else if (result == 0)
-                            {
-                                ESP_LOGI(TAG, "Node already exists, skipping");
-                            }
-                            else
-                            {
-                                ESP_LOGW(TAG, "Mesh handler storage full, cannot add node!");
-                            }
-                        }
+                        memcpy(mac, value_data, 6);
+                        mac_from_payload = true;
+                        int result = mesh_handler_add_node(unicast_addr, mac);
+                        if (result == 1)
+                            ESP_LOGI(TAG, "New node stored: Unicast=0x%04X", unicast_addr);
                     }
-                    length += mpid_len + data_len + 1;
-                    data += mpid_len + data_len + 1;
+                    else if (prop_id == TEMP_PROPERTY_ID_0 && value_bytes >= 1)
+                    {
+                        temp_val = (int8_t)value_data[0];
+                    }
+                    else if (prop_id == HUM_PROPERTY_ID_1 && value_bytes >= 1)
+                    {
+                        hum_val = (int8_t)value_data[0];
+                    }
+                    length += mpid_len + value_bytes;
+                    data += mpid_len + value_bytes;
                 }
                 else
                 {
                     length += mpid_len;
                     data += mpid_len;
+                }
+            }
+
+            /* Gateway: upload to ThingBoard — own data → device method, other nodes → gateway method.
+             * Use source unicast (ctx.addr): same as our primary = own; else = node data. */
+            if (!mac_from_payload)
+            {
+                (void)mesh_handler_get_mac(unicast_addr, mac);
+            }
+            char mesh_type[20];
+            nvs_get_string_value("mesh_type", mesh_type);
+            /* Upload all values (temp, humidity) in one payload; no extra condition */
+            if (strcmp(mesh_type, "mesh_gateway") == 0 && (temp_val > -128 || hum_val > -128))
+            {
+                bool is_own = (unicast_addr == s_primary_unicast_addr);
+                ESP_LOGI(TAG, "addr 0x%04x %s (our primary 0x%04x) -> %s", unicast_addr,
+                         is_own ? "own" : "node", s_primary_unicast_addr,
+                         is_own ? "device/telemetry" : "gateway/telemetry");
+
+                if (is_own)
+                {
+                    /* Gateway updates own data directly (MQTT task): skip processing when received from group */
+                    /* Skip: gateway already updated mesh attribute and sent telemetry directly */
+                }
+                else
+                {
+                    /* Other node's data → gateway telemetry: always include both temp and humidity (0 if missing) */
+                    char json_params[256];
+                    int t = (temp_val > -128) ? temp_val : 0;
+                    int h = (hum_val > -128) ? hum_val : 0;
+                    snprintf(json_params, sizeof(json_params),
+                             "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"temp\":%d,\"humidity\":%d}]}",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], t, h);
+                    publish_sensor_data("v1/gateway/telemetry", json_params);
                 }
             }
         }
@@ -1241,8 +1271,28 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
 }
 
 /**
- * @brief Generic Server callback (standard Generic OnOff = light bulb)
- * When Generic OnOff Set is received, drive LED strip.
+ * Node: publish bulb OnOff status to mesh group (0xC000). Gateway listens and updates telemetry.
+ */
+static void ble_mesh_publish_onoff_status_to_group(void)
+{
+    esp_ble_mesh_msg_ctx_t ctx = {
+        .net_idx = 0,
+        .app_idx = 0,
+        .addr = ONOFF_GROUP_ADDR,
+        .send_ttl = 7,
+    };
+    uint8_t payload = s_bulb_onoff;
+    esp_err_t err = esp_ble_mesh_server_model_send_msg(onoff_pub.model, &ctx,
+                                                       ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 1, &payload);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to publish OnOff status to group (err %d)", err);
+    }
+}
+
+/**
+ * Generic Server callback (bulb): on Set from mesh, update mesh attribute (s_bulb_onoff) and LED.
+ * Node: then publish OnOff status to group so gateway listens and updates telemetry.
  */
 static void ble_mesh_generic_server_cb(esp_ble_mesh_generic_server_cb_event_t event,
                                        esp_ble_mesh_generic_server_cb_param_t *param)
@@ -1252,8 +1302,58 @@ static void ble_mesh_generic_server_cb(esp_ble_mesh_generic_server_cb_event_t ev
             || param->ctx.recv_op == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK))
     {
         uint8_t onoff = param->value.state_change.onoff_set.onoff;
-        led_strip_set(onoff);
+        ble_mesh_set_bulb_attribute(onoff);
         ESP_LOGI(TAG, "Generic OnOff (bulb) %s", onoff ? "ON" : "OFF");
+        /* If node: send updated status to group → gateway listens and updates ThingBoard */
+        char node_type[20];
+        nvs_get_string_value("node_type", node_type);
+        if (strcmp(node_type, "sensor_server") == 0)
+        {
+            ble_mesh_publish_onoff_status_to_group();
+        }
+    }
+}
+
+/**
+ * Gateway: listens to group (0xC000). Node publishes OnOff status to group → gateway receives
+ * and updates telemetry (device for own, gateway telemetry for other nodes).
+ */
+static void ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t event,
+                                       esp_ble_mesh_generic_client_cb_param_t *param)
+{
+    if (param->error_code)
+    {
+        return;
+    }
+    if (event == ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT
+        && param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS
+        && param->status_cb.onoff_status.present_onoff != 0xFF)
+    {
+        uint16_t src_addr = param->params->ctx.addr;
+        uint8_t onoff = param->status_cb.onoff_status.present_onoff;
+        char mesh_type[20];
+        nvs_get_string_value("mesh_type", mesh_type);
+        if (strcmp(mesh_type, "mesh_gateway") != 0)
+        {
+            return;
+        }
+        bool is_own = (src_addr == s_primary_unicast_addr);
+        if (is_own)
+        {
+            /* Gateway updates own data directly (RPC/button): skip processing when received from group */
+            /* Skip: gateway already updated mesh attribute and sent telemetry directly */
+        }
+        else
+        {
+            /* Node sent status to group → update that node's status in ThingBoard */
+            uint8_t mac[6] = {0};
+            (void)mesh_handler_get_mac(src_addr, mac);
+            char json[128];
+            snprintf(json, sizeof(json),
+                     "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"bulb\":\"%s\"}]}",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], onoff ? "on" : "off");
+            publish_sensor_data("v1/gateway/telemetry", json);
+        }
     }
 }
 
@@ -1324,6 +1424,7 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_mesh_register_sensor_server_callback(ble_mesh_sensor_server_cb);
     esp_ble_mesh_register_sensor_client_callback(ble_mesh_sensor_client_cb);
     esp_ble_mesh_register_generic_server_callback(ble_mesh_generic_server_cb);
+    esp_ble_mesh_register_generic_client_callback(ble_mesh_generic_client_cb);
     esp_ble_mesh_register_custom_model_callback(custom_model_cb);
 
     err = esp_ble_mesh_init(&provision, &composition);
@@ -1347,46 +1448,45 @@ static esp_err_t ble_mesh_init(void)
     return ESP_OK;
 }
 
-// Task to fetch the ESP32 BLE MAC and store it in a sensor state for publishing
-static void store_mac_in_sensor(void *arg)
+/* Node: update temp, hum, MAC in mesh and publish to group (0xC000). Gateway listens and updates telemetry. */
+static void sensor_group_publish_task(void *arg)
 {
+    uint8_t status[64]; /* Marshalled sensor data for all 3 properties */
+    uint16_t len;
+
     while (1)
     {
-        uint8_t *mac = esp_bt_dev_get_address(); // Must be after esp_bluedroid_enable()
+        uint8_t *mac = esp_bt_dev_get_address();
+        /* Update values (simulated temp/humidity; real MAC) */
+        temperature = (int8_t)(15 + (rand() % 21));   /* 15–35 °C */
+        humidity = (int8_t)(30 + (rand() % 41));     /* 30–70 % */
+        net_buf_simple_reset(&temperature_data_0);
+        net_buf_simple_add_u8(&temperature_data_0, (uint8_t)temperature);
+        net_buf_simple_reset(&humidity_data_1);
+        net_buf_simple_add_u8(&humidity_data_1, (uint8_t)humidity);
         if (mac)
         {
-            ESP_LOGI(TAG, "Bluetooth MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            net_buf_simple_reset(&mac_address_data_2);
+            net_buf_simple_add_mem(&mac_address_data_2, mac, 6);
+            sensor_states[2].sensor_data.length = 6;
         }
-        else
+
+        /* Build marshalled sensor data and publish (destination set by app) */
+        len = 0;
+        for (int i = 0; i < ARRAY_SIZE(sensor_states); i++)
         {
-            ESP_LOGE(TAG, "Failed to get Bluetooth MAC");
+            len += ble_mesh_get_sensor_data(&sensor_states[i], status + len);
         }
-        net_buf_simple_reset(&mac_address_data_2);
-
-        // Store the 6-byte MAC
-        net_buf_simple_add_mem(&mac_address_data_2, mac, 6);
-
-        // Update sensor state length
-        sensor_states[2].sensor_data.length = 6;
-
-        ESP_LOGI(TAG, "MAC stored in sensor_data_2: %02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-        // Prepare payload to publish
-        uint8_t status[10]; // buffer for sending sensor data
-        uint16_t len = 0;
-        len += ble_mesh_get_sensor_data(&sensor_states[2], status + len);
-
         esp_err_t err = esp_ble_mesh_model_publish(sensor_pub.model,
                                                    ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS,
                                                    len, status, ROLE_NODE);
         if (err != ESP_OK)
         {
-            ESP_LOGE(TAG, "Failed to publish sensor 2 (err %d)", err);
+            ESP_LOGE(TAG, "Failed to publish sensor data (err %d)", err);
         }
-        vTaskDelay(pdMS_TO_TICKS(10000));
-    } // Update every 60 seconds
+
+        vTaskDelay(pdMS_TO_TICKS(10000)); /* Every 10 seconds */
+    }
 }
 
 // Helper function to setup common BLE Mesh client parameters
@@ -1464,43 +1564,112 @@ uint16_t get_primary_unicast(void)
     return s_primary_unicast_addr;
 }
 
-// Periodic task to request sensor data from all nodes
-static void sensor_update_task(void *arg)
+void ble_mesh_set_bulb_attribute(int on)
 {
-    uint16_t property_ids[] = {
-        TEMP_PROPERTY_ID_0,
-        HUM_PROPERTY_ID_1};
-    size_t property_count = sizeof(property_ids) / sizeof(property_ids[0]);
+    s_bulb_onoff = (on ? 1 : 0);
+    led_strip_set(s_bulb_onoff);
+    /* Gateway & node: s_bulb_onoff is the mesh OnOff attribute (Status/GET use it). */
+}
 
-    while (1)
+int ble_mesh_get_bulb_attribute(void)
+{
+    return (int)s_bulb_onoff;
+}
+
+/**
+ * Gateway: update sensor mesh attribute (temp, hum, MAC) so mesh model state is in sync; then send to TB separately.
+ * Call when gateway has new temp/hum (MQTT task or when receiving own sensor data from mesh).
+ */
+void ble_mesh_update_sensor_mesh_attribute(int8_t temp, int8_t humidity)
+{
+    temperature = temp;
+    humidity = humidity;
+    net_buf_simple_reset(&temperature_data_0);
+    net_buf_simple_add_u8(&temperature_data_0, (uint8_t)temperature);
+    net_buf_simple_reset(&humidity_data_1);
+    net_buf_simple_add_u8(&humidity_data_1, (uint8_t)humidity);
+    uint8_t *mac = esp_bt_dev_get_address();
+    if (mac)
     {
-        size_t count = mesh_handler_get_node_count();
-        ESP_LOGI(TAG, "Starting periodic sensor read for %zu nodes", count);
-
-        for (size_t i = 0; i < count; i++)
-        {
-            uint16_t unicast_addr;
-            uint8_t mac[6];
-            if (mesh_handler_get_node_info(i, &unicast_addr, mac))
-            {
-                ESP_LOGI(TAG, "Requesting sensor data from node 0x%04x", unicast_addr);
-
-                for (size_t j = 0; j < property_count; j++)
-                {
-                    ble_mesh_send_sensor_message(
-                        unicast_addr,
-                        ESP_BLE_MESH_MODEL_OP_SENSOR_GET,
-                        property_ids[j]);
-                    vTaskDelay(pdMS_TO_TICKS(1000)); // short gap between messages
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-
-        // Wait 5 minutes before next round
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        memcpy(mac_address, mac, 6);
+        net_buf_simple_reset(&mac_address_data_2);
+        net_buf_simple_add_mem(&mac_address_data_2, mac, 6);
+        sensor_states[2].sensor_data.length = 6;
     }
 }
+
+/**
+ * Button tap: toggle bulb. If node → send updated status to group (gateway listens and updates ThingBoard).
+ * If gateway → upload own status to ThingBoard.
+ */
+void ble_mesh_bulb_toggle_from_button(void)
+{
+    int current_on = ble_mesh_get_bulb_attribute();
+    int new_on = current_on ? 0 : 1;
+    ESP_LOGI(TAG, "Button toggle: current=%d, new=%d", current_on, new_on);
+    ble_mesh_set_bulb_attribute(new_on);
+    char node_type[20];
+    char mesh_type[20];
+    nvs_get_string_value("node_type", node_type);
+    nvs_get_string_value("mesh_type", mesh_type);
+    ESP_LOGI(TAG, "Node type: %s, Mesh type: %s", node_type, mesh_type);
+    if (strcmp(node_type, "sensor_server") == 0)
+    {
+        /* Node: send updated status to group → gateway will receive and update ThingBoard */
+        ESP_LOGI(TAG, "Publishing OnOff status to group (node mode)");
+        ble_mesh_publish_onoff_status_to_group();
+    }
+    else if (strcmp(mesh_type, "mesh_gateway") == 0)
+    {
+        /* Gateway: update mesh attribute and send telemetry directly (skip when received from group) */
+        ESP_LOGI(TAG, "Sending telemetry directly (gateway mode)");
+        char json[64];
+        snprintf(json, sizeof(json), "{\"bulb\":\"%s\"}", new_on ? "on" : "off");
+        publish_sensor_data("v1/devices/me/telemetry", json);
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Unknown node/mesh type, not publishing");
+    }
+}
+
+// // Periodic task to request sensor data from all nodes
+// static void sensor_update_task(void *arg)
+// {
+//     uint16_t property_ids[] = {
+//         TEMP_PROPERTY_ID_0,
+//         HUM_PROPERTY_ID_1};
+//     size_t property_count = sizeof(property_ids) / sizeof(property_ids[0]);
+
+//     while (1)
+//     {
+//         size_t count = mesh_handler_get_node_count();
+//         ESP_LOGI(TAG, "Starting periodic sensor read for %zu nodes", count);
+
+//         for (size_t i = 0; i < count; i++)
+//         {
+//             uint16_t unicast_addr;
+//             uint8_t mac[6];
+//             if (mesh_handler_get_node_info(i, &unicast_addr, mac))
+//             {
+//                 ESP_LOGI(TAG, "Requesting sensor data from node 0x%04x", unicast_addr);
+
+//                 for (size_t j = 0; j < property_count; j++)
+//                 {
+//                     ble_mesh_send_sensor_message(
+//                         unicast_addr,
+//                         ESP_BLE_MESH_MODEL_OP_SENSOR_GET,
+//                         property_ids[j]);
+//                     vTaskDelay(pdMS_TO_TICKS(1000)); // short gap between messages
+//                 }
+//             }
+//             vTaskDelay(pdMS_TO_TICKS(1000));
+//         }
+
+//         // Wait 5 minutes before next round
+//         vTaskDelay(pdMS_TO_TICKS(10000));
+//     }
+// }
 
 // Main function for BLE Mesh
 void ble_mesh_main(void)

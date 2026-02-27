@@ -124,7 +124,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     cJSON_free(params_str);
                 }
 
-                /* set_bulb: RPC → send Generic OnOff to particular node (unicast). No subscription needed. */
+                /* set_bulb: RPC → if own device: update LED and send status direct; else: send mesh command to node. */
                 if (cJSON_IsString(method) && strcmp(method->valuestring, "set_bulb") == 0)
                 {
                     cJSON *state = cJSON_GetObjectItem(params, "state");
@@ -139,14 +139,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     }
                     /* Target = particular node unicast (params.address). If omitted, this device. */
                     uint16_t target = cJSON_IsNumber(addr_item) ? (uint16_t)addr_item->valueint : get_primary_unicast();
-                    if (target != 0)
+                    uint16_t own_addr = get_primary_unicast();
+                    
+                    if (target == 0)
                     {
-                        ble_mesh_send_bulb_command(target, on);
-                        ESP_LOGI(TAG, "RPC set_bulb: %s to node 0x%04x (unicast)", on ? "ON" : "OFF", target);
+                        ESP_LOGW(TAG, "RPC set_bulb: device not provisioned or invalid address");
+                    }
+                    else if (target == own_addr)
+                    {
+                        /* RPC command for own device: update LED directly and send status to ThingBoard */
+                        ble_mesh_set_bulb_attribute(on);
+                        ESP_LOGI(TAG, "RPC set_bulb: %s (own device, direct update)", on ? "ON" : "OFF");
+                        
+                        /* Send status directly to ThingBoard */
+                        char json[64];
+                        snprintf(json, sizeof(json), "{\"bulb\":\"%s\"}", on ? "on" : "off");
+                        publish_sensor_data(TOPIC_DEVICE_TELEMETRY, json);
                     }
                     else
                     {
-                        ESP_LOGW(TAG, "RPC set_bulb: provide params.address (unicast) or ensure device is provisioned");
+                        /* RPC command for other node: send mesh command */
+                        ble_mesh_send_bulb_command(target, on);
+                        ESP_LOGI(TAG, "RPC set_bulb: %s to node 0x%04x (mesh command)", on ? "ON" : "OFF", target);
                     }
                 }
             }
@@ -194,11 +208,11 @@ static void sensor_data_update(void *arg)
             int temp_val = (rand() % 40) + 10;
             int humidity_val = (rand() % 80) + 10;
 
-            // Own device telemetry: {"key1":"value1", "key2":"value2"} to v1/devices/me/telemetry
+            /* Gateway: update mesh sensor attribute (temp, hum, MAC) then send to ThingBoard */
+            ble_mesh_update_sensor_mesh_attribute((int8_t)temp_val, (int8_t)humidity_val);
             char json_params[128];
             snprintf(json_params, sizeof(json_params),
                      "{\"temp\":%d,\"humidity\":%d}", temp_val, humidity_val);
-
             publish_sensor_data(TOPIC_DEVICE_TELEMETRY, json_params);
         }
         else

@@ -12,14 +12,12 @@
 #include "esp_log.h"
 
 #include "esp_ble_mesh_sensor_model_api.h"
-// #include "iot_button.h"
+#include "iot_button.h"
 #include "board.h"
-
-
-extern void example_ble_mesh_send_sensor_message(uint32_t opcode);
+#include "sensor_server.h"
 
 #define TAG "BOARD"
-#define BUTTON_IO_NUM 0
+#define BUTTON_IO_NUM GPIO_NUM_34
 #define BUTTON_ACTIVE_LEVEL 0
 
 struct _led_state led_state[3] = {
@@ -61,31 +59,28 @@ static void board_led_init(void)
     }
 }
 
-// static uint32_t send_opcode[] = {
-//     [0] = ESP_BLE_MESH_MODEL_OP_SENSOR_DESCRIPTOR_GET,
-//     [1] = ESP_BLE_MESH_MODEL_OP_SENSOR_CADENCE_GET,
-//     [2] = ESP_BLE_MESH_MODEL_OP_SENSOR_SETTINGS_GET,
-//     [3] = ESP_BLE_MESH_MODEL_OP_SENSOR_GET,
-//     [4] = ESP_BLE_MESH_MODEL_OP_SENSOR_SERIES_GET,
-// };
-// static uint8_t press_count;
+static void button_tap_cb(void* arg)
+{
+    ESP_LOGI(TAG, "Button pressed! Toggling LED and sending update to group");
+    /* On button press: toggle LED and send update to group so gateway receives it */
+    ble_mesh_bulb_toggle_from_button();
+    ESP_LOGI(TAG, "Button press handled");
+}
 
-// static void button_tap_cb(void* arg)
-// {
-//    example_ble_mesh_send_sensor_message(send_opcode[press_count++]);
-//     press_count = press_count % ARRAY_SIZE(send_opcode);
-// }
-
-// static void board_button_init(void)
-// {
-//     button_handle_t btn_handle = iot_button_create(BUTTON_IO_NUM, BUTTON_ACTIVE_LEVEL);
-//     if (btn_handle) {
-//         iot_button_set_evt_cb(btn_handle, BUTTON_CB_RELEASE, button_tap_cb, "RELEASE");
-//     }
-// }
+static void board_button_init(void)
+{
+    ESP_LOGI(TAG, "Initializing button on GPIO %d, active level %d", BUTTON_IO_NUM, BUTTON_ACTIVE_LEVEL);
+    button_handle_t btn_handle = iot_button_create(BUTTON_IO_NUM, BUTTON_ACTIVE_LEVEL);
+    if (btn_handle) {
+        iot_button_set_evt_cb(btn_handle, BUTTON_CB_RELEASE, button_tap_cb, "RELEASE");
+        ESP_LOGI(TAG, "Button initialized successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to initialize button!");
+    }
+}
 
 void board_init(void)
 {
     board_led_init();
-    // board_button_init();
+    board_button_init();
 }
