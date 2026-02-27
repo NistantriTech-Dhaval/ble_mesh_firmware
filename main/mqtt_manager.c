@@ -86,94 +86,109 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         s_mqtt_connected = false;
         break;
 
-    case MQTT_EVENT_DATA: {
-        int data_len = event->data_len;
-        if (data_len <= 0)
-        {
-            break;
-        }
+case MQTT_EVENT_DATA: {
+    int data_len = event->data_len;
+    if (data_len <= 0) break;
 
-        /* Copy payload and null-terminate */
-        char *payload = malloc((size_t)data_len + 1);
-        if (!payload)
-        {
-            break;
-        }
-        memcpy(payload, event->data, (size_t)data_len);
-        payload[data_len] = '\0';
+    char *payload = malloc((size_t)data_len + 1);
+    if (!payload) break;
 
-        /* Print received RPC: raw payload */
-        ESP_LOGI(TAG, "RPC received payload: %s", payload);
+    memcpy(payload, event->data, (size_t)data_len);
+    payload[data_len] = '\0';
 
-        /* Parse and print method + params; handle led_status RPC */
-        cJSON *root = cJSON_Parse(payload);
-        if (root)
-        {
-            cJSON *method = cJSON_GetObjectItem(root, "method");
-            cJSON *params = cJSON_GetObjectItem(root, "params");
-            if (cJSON_IsString(method))
-            {
-                ESP_LOGI(TAG, "RPC method: %s", method->valuestring);
-            }
-            if (params && cJSON_IsObject(params))
-            {
-                char *params_str = cJSON_PrintUnformatted(params);
-                if (params_str)
-                {
-                    ESP_LOGI(TAG, "RPC params: %s", params_str);
-                    cJSON_free(params_str);
-                }
+    ESP_LOGI(TAG, "RPC received payload: %s", payload);
 
-                /* set_bulb: RPC → if own device: update LED and send status direct; else: send mesh command to node. */
-                if (cJSON_IsString(method) && strcmp(method->valuestring, "set_bulb") == 0)
-                {
-                    cJSON *state = cJSON_GetObjectItem(params, "state");
-                    cJSON *addr_item = cJSON_GetObjectItem(params, "address");
-                    int on = 0;
-                    if (cJSON_IsString(state))
-                    {
-                        if (strcmp(state->valuestring, "on") == 0)
-                            on = 1;
-                        else if (strcmp(state->valuestring, "off") == 0)
-                            on = 0;
-                    }
-                    /* Target = particular node unicast (params.address). If omitted, this device. */
-                    uint16_t target = cJSON_IsNumber(addr_item) ? (uint16_t)addr_item->valueint : get_primary_unicast();
-                    uint16_t own_addr = get_primary_unicast();
-                    
-                    if (target == 0)
-                    {
-                        ESP_LOGW(TAG, "RPC set_bulb: device not provisioned or invalid address");
-                    }
-                    else if (target == own_addr)
-                    {
-                        /* RPC command for own device: update LED directly and send status to ThingBoard */
-                        ble_mesh_set_bulb_attribute(on);
-                        ESP_LOGI(TAG, "RPC set_bulb: %s (own device, direct update)", on ? "ON" : "OFF");
-                        
-                        /* Send status directly to ThingBoard */
-                        char json[64];
-                        snprintf(json, sizeof(json), "{\"bulb\":\"%s\"}", on ? "on" : "off");
-                        publish_sensor_data(TOPIC_DEVICE_TELEMETRY, json);
-                    }
-                    else
-                    {
-                        /* RPC command for other node: send mesh command */
-                        ble_mesh_send_bulb_command(target, on);
-                        ESP_LOGI(TAG, "RPC set_bulb: %s to node 0x%04x (mesh command)", on ? "ON" : "OFF", target);
-                    }
-                }
-            }
-            cJSON_Delete(root);
-        }
-        else
-        {
-            ESP_LOGW(TAG, "RPC payload not valid JSON");
-        }
-
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) {
+        ESP_LOGW(TAG, "RPC payload not valid JSON");
         free(payload);
         break;
     }
+
+    // Accept both:
+    // 1) { "method": "...", "params": {...} }
+    // 2) { "device": "...", "data": { "id":..., "method":"...", "params": {...} } }
+    cJSON *data_obj = cJSON_GetObjectItem(root, "data");
+    cJSON *method   = NULL;
+    cJSON *params   = NULL;
+    cJSON *req_id   = NULL;
+
+    if (cJSON_IsObject(data_obj)) {
+        method = cJSON_GetObjectItem(data_obj, "method");
+        params = cJSON_GetObjectItem(data_obj, "params");
+        req_id = cJSON_GetObjectItem(data_obj, "id");
+    } else {
+        method = cJSON_GetObjectItem(root, "method");
+        params = cJSON_GetObjectItem(root, "params");
+        req_id = cJSON_GetObjectItem(root, "id");
+    }
+
+    if (cJSON_IsNumber(req_id)) {
+        ESP_LOGI(TAG, "RPC id: %d", req_id->valueint);
+    }
+
+    if (cJSON_IsString(method)) {
+        ESP_LOGI(TAG, "RPC method: %s", method->valuestring);
+    } else {
+        ESP_LOGW(TAG, "RPC method missing/invalid");
+    }
+
+    if (params && cJSON_IsObject(params)) {
+        char *params_str = cJSON_PrintUnformatted(params);
+        if (params_str) {
+            ESP_LOGI(TAG, "RPC params: %s", params_str);
+            cJSON_free(params_str);
+        }
+    }
+
+    // Handle set_bulb
+    if (cJSON_IsString(method) && strcmp(method->valuestring, "set_bulb") == 0 && cJSON_IsObject(params)) {
+        cJSON *state     = cJSON_GetObjectItem(params, "state");
+        cJSON *addr_item = cJSON_GetObjectItem(params, "address");
+
+        int on = 0;
+
+        // Accept "on"/"off", true/false, 1/0
+        if (cJSON_IsString(state)) {
+            on = (strcmp(state->valuestring, "on") == 0) ? 1 : 0;
+        } else if (cJSON_IsBool(state)) {
+            on = cJSON_IsTrue(state) ? 1 : 0;
+        } else if (cJSON_IsNumber(state)) {
+            on = (state->valueint != 0) ? 1 : 0;
+        }
+
+        uint16_t own_addr = get_primary_unicast();
+
+        // address in your example is "8" (decimal). Often mesh unicast is like 0x0008.
+        uint16_t target = own_addr;
+        if (cJSON_IsNumber(addr_item)) {
+            target = (uint16_t)addr_item->valueint;
+        }
+
+        if (own_addr == 0) {
+            ESP_LOGW(TAG, "RPC set_bulb: device not provisioned (own_addr=0)");
+        } else if (target == 0) {
+            ESP_LOGW(TAG, "RPC set_bulb: invalid target address=0");
+        } else if (target == own_addr) {
+            // Own device: update + publish
+            ble_mesh_set_bulb_attribute(on);
+            ESP_LOGI(TAG, "RPC set_bulb: %s (own device, direct update)", on ? "ON" : "OFF");
+
+            char json[64];
+            snprintf(json, sizeof(json), "{\"bulb\":\"%s\",\"address\":%u}", on ? "on" : "off", (unsigned)own_addr);
+            publish_sensor_data(TOPIC_DEVICE_TELEMETRY, json);
+        } else {
+            // Other node: mesh command
+            ble_mesh_send_bulb_command(target, on);
+            ESP_LOGI(TAG, "RPC set_bulb: %s to node %u (0x%04x) (mesh command)",
+                     on ? "ON" : "OFF", (unsigned)target, (unsigned)target);
+        }
+    }
+
+    cJSON_Delete(root);
+    free(payload);
+    break;
+}
 
     default:
         break;
