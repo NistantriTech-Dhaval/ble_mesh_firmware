@@ -175,7 +175,7 @@ case MQTT_EVENT_DATA: {
             ESP_LOGI(TAG, "RPC set_bulb: %s (own device, direct update)", on ? "ON" : "OFF");
 
             char json[64];
-            snprintf(json, sizeof(json), "{\"bulb\":\"%s\",\"address\":%u}", on ? "on" : "off", (unsigned)own_addr);
+            snprintf(json, sizeof(json), "{\"bulb\":\"%s\"}", on ? "on" : "off");
             publish_sensor_data(TOPIC_DEVICE_TELEMETRY, json);
         } else {
             // Other node: mesh command
