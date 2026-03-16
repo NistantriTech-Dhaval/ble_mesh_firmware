@@ -35,6 +35,7 @@
 #include "esp_ble_mesh_sensor_model_api.h"
 #include "esp_ble_mesh_generic_model_api.h"
 #include "esp_ble_mesh_networking_api.h"
+#include "esp_ble_mesh_health_model_api.h"
 #include "esp_err.h"
 #include "mesh_handler.h"
 #include "esp_bt.h"
@@ -175,6 +176,17 @@ static uint8_t s_bulb_onoff = 0;
 /* Generic OnOff Client (gateway sends OnOff Set to group/unicast) */
 static esp_ble_mesh_client_t gen_onoff_client;
 
+/* ================= Health Server (fixes "No Health Server context provided" & protocol timeout) ================= */
+static const uint8_t health_test_ids[] = { ESP_BLE_MESH_HEALTH_STANDARD_TEST };
+ESP_BLE_MESH_HEALTH_PUB_DEFINE(health_pub, 0, ROLE_NODE);
+static esp_ble_mesh_health_srv_t health_server = {
+    .health_test = {
+        .id_count = ARRAY_SIZE(health_test_ids),
+        .test_ids = health_test_ids,
+        .company_id = CID_ESP,
+    },
+};
+
 /* ================= Vendor Model Definition ================= */
 
 /* Vendor model operations (opcodes) */
@@ -202,6 +214,7 @@ static esp_ble_mesh_client_t sensor_client;
 /* Root element models for this node */
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),                                   // Configuration server model
+    ESP_BLE_MESH_MODEL_HEALTH_SRV(&health_server, &health_pub),                  // Health server (avoids "No Health Server context" / protocol timeout)
     ESP_BLE_MESH_MODEL_SENSOR_SRV(&sensor_pub, &sensor_server),                   // Standard sensor server
     ESP_BLE_MESH_MODEL_SENSOR_SETUP_SRV(&sensor_setup_pub, &sensor_setup_server), // Sensor setup server
     ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub, &onoff_server),                  // Standard Generic OnOff (light bulb)
@@ -313,17 +326,9 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
     switch (event)
     {
     case ESP_BLE_MESH_PROV_REGISTER_COMP_EVT:
-        /* Node registration complete event
-         * Check node type from NVS ("sensor_server" or other)
-         * - If node (sensor_server): publish sensor data to group every 10s (gateway subscribes and uploads to ThingBoard)
-         * - If gateway: subscribe to group is done by configurator; gateway handles upload in sensor client callback
-         */
-        char node_type[20];
-        nvs_get_string_value("node_type", node_type);
-        if (strcmp(node_type, "sensor_server") == 0)
-        {
-            xTaskCreate(sensor_group_publish_task, "sensor_grp_pub", 2048, NULL, 5, NULL);
-        }
+        /* Node registration complete. Do NOT start sensor publish task here:
+         * start it only after NODE_PROV_COMPLETE so provisioning + config (AppKey, Sub)
+         * can finish first, avoiding "Failed to publish (err 258)" and proxy SAR issues. */
         ESP_LOGI(TAG, "ESP_BLE_MESH_PROV_REGISTER_COMP_EVT, err_code %d", param->prov_register_comp.err_code);
         break;
     case ESP_BLE_MESH_NODE_PROV_ENABLE_COMP_EVT:
@@ -345,6 +350,17 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
         ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_COMPLETE_EVT");
         prov_complete(param->node_prov_complete.net_idx, param->node_prov_complete.addr,
                       param->node_prov_complete.flags, param->node_prov_complete.iv_index);
+        /* Start sensor publish task only after provisioning; task will delay before first publish
+         * so config (AppKey, Model Bind, Sub) over proxy can complete (reduces err 258 / SAR issues). */
+        {
+            char node_type[20];
+            nvs_get_string_value("node_type", node_type);
+            if (strcmp(node_type, "sensor_server") == 0)
+            {
+                xTaskCreate(sensor_group_publish_task, "sensor_grp_pub", 2048, NULL, 5, NULL);
+                ESP_LOGI(TAG, "Sensor group publish task created (will run after config delay)");
+            }
+        }
         break;
     case ESP_BLE_MESH_NODE_PROV_RESET_EVT: {
         ESP_LOGI(TAG, "ESP_BLE_MESH_NODE_PROV_RESET_EVT — erasing NVS and restarting to allow re-provisioning");
@@ -353,6 +369,10 @@ static void ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "nvs_flash_erase failed: %s", esp_err_to_name(err));
         }
+
+    ESP_LOGI(TAG, "Restarting in 3 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(3000));   // Delay 3 seconds
+
         esp_restart();
         break;
     }
@@ -1411,6 +1431,23 @@ static void custom_model_cb(esp_ble_mesh_model_cb_event_t event, esp_ble_mesh_mo
     }
 }
 
+/* Minimal Health Server callback so stack has context (fixes "No Health Server context provided"). */
+static void ble_mesh_health_server_cb(esp_ble_mesh_health_server_cb_event_t event,
+                                      esp_ble_mesh_health_server_cb_param_t *param)
+{
+    (void)param;
+    switch (event)
+    {
+    case ESP_BLE_MESH_HEALTH_SERVER_FAULT_UPDATE_COMP_EVT:
+    case ESP_BLE_MESH_HEALTH_SERVER_FAULT_CLEAR_EVT:
+    case ESP_BLE_MESH_HEALTH_SERVER_FAULT_TEST_EVT:
+    case ESP_BLE_MESH_HEALTH_SERVER_ATTENTION_ON_EVT:
+    case ESP_BLE_MESH_HEALTH_SERVER_ATTENTION_OFF_EVT:
+    default:
+        break;
+    }
+}
+
 // Initialize BLE Mesh and related callbacks
 static esp_err_t ble_mesh_init(void)
 {
@@ -1425,6 +1462,7 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_mesh_register_sensor_client_callback(ble_mesh_sensor_client_cb);
     esp_ble_mesh_register_generic_server_callback(ble_mesh_generic_server_cb);
     esp_ble_mesh_register_generic_client_callback(ble_mesh_generic_client_cb);
+    esp_ble_mesh_register_health_server_callback(ble_mesh_health_server_cb);
     esp_ble_mesh_register_custom_model_callback(custom_model_cb);
 
     err = esp_ble_mesh_init(&provision, &composition);
@@ -1448,11 +1486,22 @@ static esp_err_t ble_mesh_init(void)
     return ESP_OK;
 }
 
+/* Delay before first publish so config over GATT proxy (AppKey, Bind, Sub) can complete.
+ * Reduces "Failed to publish (err 258)", "Proxy SAR timeout", and "No matching TX context". */
+#define SENSOR_PUBLISH_INITIAL_DELAY_MS  (25000)
+#define SENSOR_PUBLISH_RETRY_COUNT       (2)
+#define SENSOR_PUBLISH_RETRY_DELAY_MS    (2000)
+
 /* Node: update temp, hum, MAC in mesh and publish to group (0xC000). Gateway listens and updates telemetry. */
 static void sensor_group_publish_task(void *arg)
 {
     uint8_t status[64]; /* Marshalled sensor data for all 3 properties */
     uint16_t len;
+
+    /* Wait for configurator (e.g. Android) to finish AppKey, Model Bind, Subscription over proxy.
+     * Avoids publish before stack is ready (err 258) and reduces proxy SAR/retransmit issues. */
+    ESP_LOGI(TAG, "Sensor publish task: waiting %d s before first publish", SENSOR_PUBLISH_INITIAL_DELAY_MS / 1000);
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_PUBLISH_INITIAL_DELAY_MS));
 
     while (1)
     {
@@ -1477,12 +1526,24 @@ static void sensor_group_publish_task(void *arg)
         {
             len += ble_mesh_get_sensor_data(&sensor_states[i], status + len);
         }
-        esp_err_t err = esp_ble_mesh_model_publish(sensor_pub.model,
-                                                   ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS,
-                                                   len, status, ROLE_NODE);
+
+        esp_err_t err;
+        for (int retry = 0; retry <= SENSOR_PUBLISH_RETRY_COUNT; retry++)
+        {
+            err = esp_ble_mesh_model_publish(sensor_pub.model,
+                                            ESP_BLE_MESH_MODEL_OP_SENSOR_STATUS,
+                                            len, status, ROLE_NODE);
+            if (err == ESP_OK)
+                break;
+            if (retry < SENSOR_PUBLISH_RETRY_COUNT)
+            {
+                ESP_LOGW(TAG, "Publish failed (err %d), retry in %d ms", err, SENSOR_PUBLISH_RETRY_DELAY_MS);
+                vTaskDelay(pdMS_TO_TICKS(SENSOR_PUBLISH_RETRY_DELAY_MS));
+            }
+        }
         if (err != ESP_OK)
         {
-            ESP_LOGE(TAG, "Failed to publish sensor data (err %d)", err);
+            ESP_LOGE(TAG, "Failed to publish sensor data after retries (err %d)", err);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10000)); /* Every 10 seconds */
