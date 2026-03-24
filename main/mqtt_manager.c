@@ -293,9 +293,11 @@ void publish_sensor_data(const char *topic, const char *data)
     if (msg_id != -1)
     {
         printf("Data successfully published to topic: %s, message ID: %d\n", topic, msg_id);
+        printf("Published data: %s\n", data);
     }
     else
     {
         ESP_LOGE(TAG, "Failed to publish data to topic: %s\n", topic);
+        ESP_LOGE(TAG, "Data attempted to publish: %s\n", data);
     }
 }

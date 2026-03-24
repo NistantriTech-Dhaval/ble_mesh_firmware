@@ -172,9 +172,35 @@ static esp_ble_mesh_gen_onoff_srv_t onoff_server = {
 };
 /* Bulb mesh attribute: OnOff state (LED + Status). Gateway: update this and send telemetry. Node: update and publish to group. */
 static uint8_t s_bulb_onoff = 0;
+static uint8_t s_onoff_tid = 0;
+static struct {
+    bool pending;
+    uint16_t addr;
+    uint8_t onoff;
+    uint8_t retries;
+} s_last_onoff_set = {0};
 
 /* Generic OnOff Client (gateway sends OnOff Set to group/unicast) */
 static esp_ble_mesh_client_t gen_onoff_client;
+
+static void publish_node_onoff_to_gateway(uint16_t src_addr, uint8_t onoff)
+{
+    uint8_t mac[6] = {0};
+    char json[160];
+    if (mesh_handler_get_mac(src_addr, mac) == 0)
+    {
+        snprintf(json, sizeof(json),
+                 "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"bulb\":\"%s\"}]}",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], onoff ? "on" : "off");
+    }
+    else
+    {
+        snprintf(json, sizeof(json),
+                 "{\"addr_0x%04X\":[{\"bulb\":\"%s\"}]}",
+                 src_addr, onoff ? "on" : "off");
+    }
+    publish_sensor_data("v1/gateway/telemetry", json);
+}
 
 /* ================= Health Server (fixes "No Health Server context provided" & protocol timeout) ================= */
 static const uint8_t health_test_ids[] = { ESP_BLE_MESH_HEALTH_STANDARD_TEST };
@@ -284,6 +310,10 @@ struct custom_sensor_setting
 /* Forward declarations for tasks created in provisioning callback */
 static void sensor_group_publish_task(void *arg);
 static void sensor_update_task(void *arg);
+static void ble_mesh_set_msg_common(esp_ble_mesh_client_common_param_t *common,
+                                    uint16_t unicast_addr,
+                                    esp_ble_mesh_model_t *model,
+                                    uint32_t opcode);
 
 /* ================= Provisioning Complete Callback ================= */
 /* This function is called when a node has been successfully provisioned
@@ -1295,15 +1325,12 @@ static void ble_mesh_sensor_client_cb(esp_ble_mesh_sensor_client_cb_event_t even
  */
 static void ble_mesh_publish_onoff_status_to_group(void)
 {
-    esp_ble_mesh_msg_ctx_t ctx = {
-        .net_idx = 0,
-        .app_idx = 0,
-        .addr = ONOFF_GROUP_ADDR,
-        .send_ttl = 7,
-    };
     uint8_t payload = s_bulb_onoff;
-    esp_err_t err = esp_ble_mesh_server_model_send_msg(onoff_pub.model, &ctx,
-                                                       ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS, 1, &payload);
+    /* Use model publication context configured by provisioner (net/app idx, period, etc).
+     * Hardcoded net_idx/app_idx can be wrong on some devices and cause intermittent misses. */
+    esp_err_t err = esp_ble_mesh_model_publish(onoff_pub.model,
+                                               ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS,
+                                               1, &payload, ROLE_NODE);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to publish OnOff status to group (err %d)", err);
@@ -1345,6 +1372,64 @@ static void ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t ev
     {
         return;
     }
+
+    if (event == ESP_BLE_MESH_GENERIC_CLIENT_SET_STATE_EVT
+        && param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET)
+    {
+        uint16_t target_addr = param->params->ctx.addr;
+        uint8_t onoff = param->status_cb.onoff_status.present_onoff;
+        if (onoff == 0xFF)
+        {
+            onoff = s_last_onoff_set.onoff;
+        }
+        s_last_onoff_set.pending = false;
+
+        char mesh_type[20];
+        nvs_get_string_value("mesh_type", mesh_type);
+        if (strcmp(mesh_type, "mesh_gateway") == 0 && target_addr != s_primary_unicast_addr)
+        {
+            /* Remote node acknowledged SET: update gateway telemetry immediately. */
+            publish_node_onoff_to_gateway(target_addr, onoff);
+        }
+        return;
+    }
+
+    if (event == ESP_BLE_MESH_GENERIC_CLIENT_TIMEOUT_EVT
+        && param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET)
+    {
+        uint16_t target_addr = param->params->ctx.addr;
+        if (s_last_onoff_set.pending && s_last_onoff_set.addr == target_addr && s_last_onoff_set.retries < 1)
+        {
+            /* Fallback once with SET_UNACK to improve actuation reliability when status ack is missed. */
+            s_last_onoff_set.retries++;
+            esp_err_t err = ESP_FAIL;
+            for (int i = 0; i < 2; i++)
+            {
+                esp_ble_mesh_client_common_param_t common = {0};
+                ble_mesh_set_msg_common(&common, target_addr, gen_onoff_client.model,
+                                        ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK);
+                esp_ble_mesh_generic_client_set_state_t set = {0};
+                set.onoff_set.op_en = false;
+                set.onoff_set.onoff = s_last_onoff_set.onoff;
+                set.onoff_set.tid = s_onoff_tid++;
+                err = esp_ble_mesh_generic_client_set_state(&common, &set);
+                if (err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Fallback SET_UNACK #%d failed for 0x%04x (err %d)", i + 1, target_addr, err);
+                    break;
+                }
+            }
+            if (err == ESP_OK)
+            {
+                ESP_LOGW(TAG, "Generic OnOff SET timeout for 0x%04x, fallback SET_UNACK burst sent", target_addr);
+                /* Ack was missed; update telemetry using commanded state so cloud view stays in sync. */
+                publish_node_onoff_to_gateway(target_addr, s_last_onoff_set.onoff);
+            }
+        }
+        s_last_onoff_set.pending = false;
+        return;
+    }
+
     if (event == ESP_BLE_MESH_GENERIC_CLIENT_PUBLISH_EVT
         && param->params->opcode == ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_STATUS
         && param->status_cb.onoff_status.present_onoff != 0xFF)
@@ -1365,14 +1450,7 @@ static void ble_mesh_generic_client_cb(esp_ble_mesh_generic_client_cb_event_t ev
         }
         else
         {
-            /* Node sent status to group → update that node's status in ThingBoard */
-            uint8_t mac[6] = {0};
-            (void)mesh_handler_get_mac(src_addr, mac);
-            char json[128];
-            snprintf(json, sizeof(json),
-                     "{\"%02X:%02X:%02X:%02X:%02X:%02X\":[{\"bulb\":\"%s\"}]}",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], onoff ? "on" : "off");
-            publish_sensor_data("v1/gateway/telemetry", json);
+            publish_node_onoff_to_gateway(src_addr, onoff);
         }
     }
 }
@@ -1592,9 +1670,6 @@ void ble_mesh_send_sensor_message(uint16_t unicast_addr, uint32_t opcode, uint16
     }
 }
 
-/* Send bulb on/off over the mesh using standard Generic OnOff Set. Target node(s) receive and drive LED. */
-static uint8_t s_onoff_tid = 0;
-
 void ble_mesh_send_bulb_command(uint16_t addr, int on)
 {
     if (!gen_onoff_client.model)
@@ -1604,7 +1679,7 @@ void ble_mesh_send_bulb_command(uint16_t addr, int on)
     }
     esp_ble_mesh_client_common_param_t common = {0};
     ble_mesh_set_msg_common(&common, addr, gen_onoff_client.model,
-                            ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET_UNACK);
+                            ESP_BLE_MESH_MODEL_OP_GEN_ONOFF_SET);
     esp_ble_mesh_generic_client_set_state_t set = {0};
     set.onoff_set.op_en = false;
     set.onoff_set.onoff = on ? 1 : 0;
@@ -1617,6 +1692,10 @@ void ble_mesh_send_bulb_command(uint16_t addr, int on)
     else
     {
         ESP_LOGI(TAG, "Sent Generic OnOff %s to 0x%04x (mesh)", on ? "ON" : "OFF", addr);
+        s_last_onoff_set.pending = true;
+        s_last_onoff_set.addr = addr;
+        s_last_onoff_set.onoff = (on ? 1 : 0);
+        s_last_onoff_set.retries = 0;
     }
 }
 
